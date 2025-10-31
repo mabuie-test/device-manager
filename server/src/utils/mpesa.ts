@@ -187,7 +187,7 @@ class MpesaClient {
     );
 
     this.securityCredential = encrypted.toString('base64');
-    return this.securityCredential;
+    return this.securityCredential!;
   }
 
   private async mpesaPost<T>(endpoint: string, body: Record<string, unknown>): Promise<T> {

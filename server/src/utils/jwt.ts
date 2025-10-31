@@ -1,4 +1,4 @@
-import jwt from 'jsonwebtoken';
+import jwt, { type Secret, type SignOptions } from 'jsonwebtoken';
 import { env } from '../config/env.js';
 
 export interface TokenPayload {
@@ -6,10 +6,13 @@ export interface TokenPayload {
   role: 'admin' | 'player';
 }
 
-export function signToken(payload: TokenPayload, expiresIn = '12h'): string {
-  return jwt.sign(payload, env.jwtSecret, { expiresIn });
+const secret: Secret = env.jwtSecret;
+
+export function signToken(payload: TokenPayload, expiresIn: string | number = '12h'): string {
+  const options: SignOptions = { expiresIn };
+  return jwt.sign(payload, secret, options);
 }
 
 export function verifyToken(token: string): TokenPayload {
-  return jwt.verify(token, env.jwtSecret) as TokenPayload;
+  return jwt.verify(token, secret) as TokenPayload;
 }

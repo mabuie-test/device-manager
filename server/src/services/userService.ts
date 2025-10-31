@@ -85,7 +85,9 @@ export async function getUserByResetToken(token: string): Promise<User | undefin
 
 export async function listUsers(): Promise<User[]> {
   const records = await UserModel.find().sort({ createdAt: -1 }).exec();
-  return records.map((record) => toUser(record)!).filter(Boolean);
+  return records
+    .map((record: UserDocument) => toUser(record)!)
+    .filter((user): user is User => Boolean(user));
 }
 
 export async function updateUserBalance(id: string, balance: number): Promise<void> {

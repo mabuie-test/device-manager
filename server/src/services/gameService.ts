@@ -172,13 +172,15 @@ export async function verifyBet(betId: string) {
   };
 }
 
+type GameStatsRow = {
+  _id: string;
+  totalBets: number;
+  totalPayout: number;
+  totalWager: number;
+};
+
 export async function getGameStatistics() {
-  const rows = await BetModel.aggregate<{
-    _id: string;
-    totalBets: number;
-    totalPayout: number;
-    totalWager: number;
-  }>([
+  const rows = await BetModel.aggregate<GameStatsRow>([
     {
       $group: {
         _id: '$gameKey',
@@ -189,7 +191,7 @@ export async function getGameStatistics() {
     },
   ]).exec();
 
-  return rows.map((row) => ({
+  return rows.map((row: GameStatsRow) => ({
     gameKey: row._id,
     totalBets: Number(row.totalBets || 0),
     totalWager: Number(row.totalWager || 0),

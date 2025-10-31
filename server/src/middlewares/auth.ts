@@ -10,7 +10,7 @@ export interface AuthenticatedRequest extends Request {
 }
 
 export async function authenticate(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  const header = req.headers.authorization;
+  const header = req.get('authorization');
   if (!header) {
     return res.status(401).json({ message: 'Token não fornecido.' });
   }
