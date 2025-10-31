@@ -54,11 +54,12 @@ administrativa e um front-end estilizado que transmite confiança.
    cd server
    cp .env.example .env
    npm install
-   npm run build
    npm start
    ```
 
-   A API ficará disponível em `http://localhost:4000`. Configure as variáveis `MONGO_URI` e `MONGO_DB_NAME` para apontar
+   O comando `npm start` compila automaticamente o código TypeScript antes de lançar o servidor, garantindo que o
+   diretório `dist/` exista mesmo em ambientes de deploy (ex.: Render). A API ficará disponível em
+   `http://localhost:4000`. Configure as variáveis `MONGO_URI` e `MONGO_DB_NAME` para apontar
    para a instância do MongoDB Atlas (ou local). O script de inicialização cria um utilizador administrador padrão
    (`admin@betpulse.co.mz / Admin@12345`) e popula automaticamente 11 jogos com probabilidade 1/4 e payout otimizado
    para lucro líquido.

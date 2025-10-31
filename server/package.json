@@ -4,6 +4,7 @@
   "description": "Provably fair betting platform backend with admin controls and Mpesa integration hooks.",
   "main": "dist/index.js",
   "scripts": {
+    "prestart": "npm run build",
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
