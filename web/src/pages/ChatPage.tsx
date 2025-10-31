@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { useAuth } from '../context/AuthContext';
 import { apiClient } from '../services/apiClient';
+import { clientEnv } from '../config/clientEnv';
 
 interface ChatMessage {
   id: string;
@@ -24,7 +25,9 @@ const ChatPage = () => {
     };
     void fetchHistory();
 
-    const socket = io('/', { path: '/socket.io' });
+    const socket = clientEnv.socketUrl
+      ? io(clientEnv.socketUrl, { path: clientEnv.socketPath, withCredentials: true })
+      : io({ path: clientEnv.socketPath, withCredentials: true });
     socketRef.current = socket;
 
     socket.on('history', (history: ChatMessage[]) => setMessages(history));
