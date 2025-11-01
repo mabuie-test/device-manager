@@ -17,28 +17,46 @@ const ChatPage = () => {
   const [input, setInput] = useState('');
   const [typing, setTyping] = useState<string | null>(null);
   const socketRef = useRef<Socket | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let active = true;
     const fetchHistory = async () => {
-      const response = await apiClient.get('/chat/history');
-      setMessages(response.data.messages);
+      try {
+        const response = await apiClient.get('/chat/history');
+        if (active) {
+          setMessages(response.data.messages);
+          setError(null);
+        }
+      } catch (err) {
+        console.error('Falha ao carregar histórico do chat', err);
+        if (active) {
+          setError('Não foi possível carregar o histórico do chat.');
+        }
+      }
     };
     void fetchHistory();
 
-    const socket = clientEnv.socketUrl
-      ? io(clientEnv.socketUrl, { path: clientEnv.socketPath, withCredentials: true })
-      : io({ path: clientEnv.socketPath, withCredentials: true });
-    socketRef.current = socket;
+    try {
+      const socket = clientEnv.socketUrl
+        ? io(clientEnv.socketUrl, { path: clientEnv.socketPath, withCredentials: true })
+        : io({ path: clientEnv.socketPath, withCredentials: true });
+      socketRef.current = socket;
 
-    socket.on('history', (history: ChatMessage[]) => setMessages(history));
-    socket.on('message', (message: ChatMessage) => setMessages((prev) => [...prev, message]));
-    socket.on('typing', (author: string) => {
-      setTyping(author);
-      setTimeout(() => setTyping(null), 2000);
-    });
+      socket.on('history', (history: ChatMessage[]) => setMessages(history));
+      socket.on('message', (message: ChatMessage) => setMessages((prev) => [...prev, message]));
+      socket.on('typing', (author: string) => {
+        setTyping(author);
+        setTimeout(() => setTyping(null), 2000);
+      });
+    } catch (err) {
+      console.error('Falha ao iniciar socket do chat', err);
+      setError('Não foi possível ligar ao chat em tempo real.');
+    }
 
     return () => {
-      socket.disconnect();
+      active = false;
+      socketRef.current?.disconnect();
     };
   }, []);
 
@@ -60,6 +78,9 @@ const ChatPage = () => {
   return (
     <div className="grid h-[70vh] gap-6 md:grid-cols-[2fr,1fr]">
       <div className="flex flex-col rounded-3xl border border-white/10 bg-slate-900/40">
+        {error && (
+          <p className="border-b border-rose-400/30 bg-rose-500/10 p-3 text-xs text-rose-200">{error}</p>
+        )}
         <div className="flex-1 space-y-3 overflow-y-auto p-6">
           {messages.map((message) => (
             <div key={message.id} className="rounded-2xl border border-white/5 bg-slate-950/60 p-4">

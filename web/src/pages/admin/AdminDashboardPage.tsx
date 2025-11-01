@@ -28,14 +28,25 @@ interface OverviewResponse {
 
 const AdminDashboardPage = () => {
   const [data, setData] = useState<OverviewResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const fetchOverview = async () => {
-      const response = await apiClient.get('/admin/overview');
-      setData(response.data);
+      try {
+        const response = await apiClient.get('/admin/overview');
+        setData(response.data);
+        setError(null);
+      } catch (err) {
+        console.error('Falha ao carregar overview admin', err);
+        setError('Não foi possível carregar as estatísticas administrativas.');
+      }
     };
     void fetchOverview();
   }, []);
+
+  if (error) {
+    return <p className="rounded-2xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">{error}</p>;
+  }
 
   if (!data) {
     return <p className="text-slate-400">A carregar estatísticas administrativas…</p>;

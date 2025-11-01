@@ -24,24 +24,59 @@ type AuthContextValue = {
   refreshProfile: () => Promise<void>;
 };
 
+const getStoredToken = () => {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  try {
+    return window.localStorage.getItem('betpulse.token');
+  } catch (error) {
+    console.warn('Não foi possível ler o token armazenado', error);
+    return null;
+  }
+};
+
+const persistToken = (value: string | null) => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    if (value) {
+      window.localStorage.setItem('betpulse.token', value);
+    } else {
+      window.localStorage.removeItem('betpulse.token');
+    }
+  } catch (error) {
+    console.warn('Não foi possível sincronizar o token com o storage', error);
+  }
+};
+
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [token, setToken] = useState<string | null>(() => localStorage.getItem('betpulse.token'));
+  const [token, setToken] = useState<string | null>(() => getStoredToken());
   const [profile, setProfile] = useState<UserProfile | null>(null);
 
   const refreshProfile = useCallback(async () => {
     if (!token) return;
-    const response = await apiClient.get('/auth/me');
-    setProfile(response.data.profile);
+    try {
+      const response = await apiClient.get('/auth/me');
+      setProfile(response.data.profile);
+    } catch (error) {
+      console.warn('Falha ao actualizar o perfil', error);
+      setProfile(null);
+    }
   }, [token]);
 
   useEffect(() => {
     if (token) {
-      localStorage.setItem('betpulse.token', token);
-      void refreshProfile();
+      persistToken(token);
+      void refreshProfile().catch((error) => {
+        console.warn('Erro ao validar sessão existente', error);
+        setToken(null);
+      });
     } else {
-      localStorage.removeItem('betpulse.token');
+      persistToken(null);
       setProfile(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

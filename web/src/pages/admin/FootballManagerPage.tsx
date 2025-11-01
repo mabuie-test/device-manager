@@ -25,10 +25,17 @@ const FootballManagerPage = () => {
     oddsAway: 3.2,
   });
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const loadMatches = async () => {
-    const response = await apiClient.get('/admin/football/matches');
-    setMatches(response.data.matches);
+    try {
+      const response = await apiClient.get('/admin/football/matches');
+      setMatches(response.data.matches);
+      setLoadError(null);
+    } catch (error) {
+      console.error('Erro ao carregar partidas de futebol', error);
+      setLoadError('Não foi possível carregar a lista de partidas.');
+    }
   };
 
   useEffect(() => {
@@ -61,8 +68,14 @@ const FootballManagerPage = () => {
   };
 
   const settleMatch = async (matchId: string, result: Record<string, unknown>) => {
-    await apiClient.post(`/admin/football/matches/${matchId}/settle`, { result });
-    await loadMatches();
+    try {
+      await apiClient.post(`/admin/football/matches/${matchId}/settle`, { result });
+      await loadMatches();
+      setFeedback('Partida liquidada com sucesso.');
+    } catch (error) {
+      console.error('Erro ao liquidar partida', error);
+      setFeedback((error as Error).message || 'Não foi possível liquidar a partida.');
+    }
   };
 
   return (
@@ -154,6 +167,9 @@ const FootballManagerPage = () => {
 
       <section className="space-y-4 overflow-y-auto rounded-3xl border border-white/10 bg-slate-900/30 p-6">
         <h3 className="text-lg font-semibold text-slate-100">Partidas registadas</h3>
+        {loadError && (
+          <p className="rounded-2xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">{loadError}</p>
+        )}
         {matches.map((match) => (
           <div key={match.id} className="rounded-2xl border border-white/10 bg-slate-950/60 p-4 text-sm text-slate-300">
             <div className="flex flex-wrap items-center justify-between gap-2">

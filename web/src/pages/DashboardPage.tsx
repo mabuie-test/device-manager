@@ -24,22 +24,32 @@ const DashboardPage = () => {
   const { profile, refreshProfile } = useAuth();
   const [bets, setBets] = useState<Bet[]>([]);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const fetchData = async () => {
-      const [betsResponse, txResponse] = await Promise.all([
-        apiClient.get('/games/bets'),
-        apiClient.get('/finance/transactions'),
-      ]);
-      setBets(betsResponse.data.bets);
-      setTransactions(txResponse.data.transactions);
-      await refreshProfile();
+      try {
+        const [betsResponse, txResponse] = await Promise.all([
+          apiClient.get('/games/bets'),
+          apiClient.get('/finance/transactions'),
+        ]);
+        setBets(betsResponse.data.bets);
+        setTransactions(txResponse.data.transactions);
+        setError(null);
+        await refreshProfile();
+      } catch (err) {
+        console.error('Erro ao carregar dashboard do jogador', err);
+        setError('Não foi possível carregar o resumo da sua conta. Verifique a ligação com o servidor.');
+      }
     };
     void fetchData();
   }, [refreshProfile]);
 
   return (
     <div className="space-y-10">
+      {error && (
+        <div className="rounded-2xl border border-rose-400/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">{error}</div>
+      )}
       <section className="grid gap-6 md:grid-cols-3">
         <div className="rounded-3xl border border-white/10 bg-slate-900/60 p-6">
           <p className="text-sm text-slate-400">Saldo disponível</p>

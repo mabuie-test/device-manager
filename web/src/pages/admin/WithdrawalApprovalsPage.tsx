@@ -40,6 +40,11 @@ const WithdrawalApprovalsPage = () => {
     try {
       const response = await apiClient.get<{ transactions: Transaction[] }>('/finance/admin/transactions');
       setTransactions(response.data.transactions);
+      setFeedback(null);
+    } catch (error) {
+      console.error('Erro ao carregar transações para aprovação', error);
+      setFeedback('Não foi possível carregar as transações pendentes.');
+      setTransactions([]);
     } finally {
       setLoading(false);
     }

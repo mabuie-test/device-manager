@@ -54,11 +54,18 @@ const GamesPage = () => {
     message: string;
     tone: 'success' | 'neutral' | 'error';
   } | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     const fetchGames = async () => {
-      const response = await apiClient.get('/games');
-      setGames(response.data.games);
+      try {
+        const response = await apiClient.get('/games');
+        setGames(response.data.games);
+        setLoadError(null);
+      } catch (error) {
+        console.error('Falha ao carregar jogos', error);
+        setLoadError('Não foi possível carregar os jogos agora. Tente novamente em instantes.');
+      }
     };
     void fetchGames();
   }, []);
@@ -117,6 +124,11 @@ const GamesPage = () => {
 
   return (
     <div className="space-y-10">
+      {loadError && (
+        <div className="rounded-2xl border border-rose-400/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+          {loadError}
+        </div>
+      )}
       <MiniGamesShowcase
         games={games}
         onSelect={setSelectedGame}
