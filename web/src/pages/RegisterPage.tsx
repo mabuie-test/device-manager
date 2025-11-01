@@ -1,9 +1,10 @@
 import { FormEvent, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import axios from 'axios';
+import { Link, Navigate, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 
 const RegisterPage = () => {
-  const { register } = useAuth();
+  const { register, isAuthenticated, isLoading } = useAuth();
   const navigate = useNavigate();
   const [form, setForm] = useState({
     email: '',
@@ -14,6 +15,14 @@ const RegisterPage = () => {
   });
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  if (isLoading) {
+    return <div className="py-10 text-center text-slate-300">A validar a sua sessão…</div>;
+  }
+
+  if (isAuthenticated) {
+    return <Navigate to="/dashboard" replace />;
+  }
 
   const updateField = (key: string, value: string) => {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -33,7 +42,12 @@ const RegisterPage = () => {
       });
       navigate('/dashboard', { replace: true });
     } catch (err) {
-      setError((err as Error).message || 'Falha ao registar.');
+      if (axios.isAxiosError(err)) {
+        const message = (err.response?.data as { message?: string } | undefined)?.message;
+        setError(message ?? 'Falha ao registar. Verifique os dados introduzidos e a disponibilidade da API.');
+      } else {
+        setError((err as Error).message || 'Falha ao registar.');
+      }
     } finally {
       setLoading(false);
     }
@@ -41,7 +55,7 @@ const RegisterPage = () => {
 
   return (
     <div className="mx-auto max-w-2xl rounded-3xl border border-white/10 bg-slate-900/50 p-10 shadow-2xl shadow-emerald/10">
-      <h1 className="text-3xl font-semibold text-slate-100">Criar conta BetPulse</h1>
+      <h1 className="text-3xl font-semibold text-slate-100">Criar conta FluxoBet</h1>
       <p className="mt-2 text-sm text-slate-400">
         Registe-se com os seus dados reais. Utilizaremos o e-mail para recuperação de palavra-passe e o seu número MPesa
         para pagamentos C2B.

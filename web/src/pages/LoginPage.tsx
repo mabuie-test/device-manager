@@ -1,15 +1,24 @@
 import { FormEvent, useState } from 'react';
-import { Link, useNavigate, useLocation } from 'react-router-dom';
+import axios from 'axios';
+import { Link, Navigate, useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 
 const LoginPage = () => {
-  const { login } = useAuth();
+  const { login, isAuthenticated, isLoading } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  if (isLoading) {
+    return <div className="py-10 text-center text-slate-300">A validar a sua sessão…</div>;
+  }
+
+  if (isAuthenticated) {
+    return <Navigate to="/dashboard" replace />;
+  }
 
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
@@ -20,7 +29,12 @@ const LoginPage = () => {
       const redirectTo = (location.state as { from?: string })?.from ?? '/dashboard';
       navigate(redirectTo, { replace: true });
     } catch (err) {
-      setError((err as Error).message || 'Falha ao autenticar.');
+      if (axios.isAxiosError(err)) {
+        const message = (err.response?.data as { message?: string } | undefined)?.message;
+        setError(message ?? 'Falha ao autenticar. Verifique as suas credenciais ou a configuração da API.');
+      } else {
+        setError((err as Error).message || 'Falha ao autenticar.');
+      }
     } finally {
       setLoading(false);
     }
@@ -41,7 +55,7 @@ const LoginPage = () => {
             id="email"
             type="email"
             className="w-full rounded-2xl border border-white/10 bg-slate-950/60 px-4 py-3 text-slate-100 focus:border-ocean focus:outline-none focus:ring-2 focus:ring-ocean/50"
-            placeholder="usuario@betpulse.co.mz"
+            placeholder="usuario@fluxobet.co.mz"
             value={email}
             onChange={(event) => setEmail(event.target.value)}
             required

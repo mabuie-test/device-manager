@@ -1,6 +1,6 @@
 # Guia de Deploy no Render
 
-Este documento descreve o processo recomendado para publicar a API (server) e o frontend (web) da plataforma BetPulse na Render. As instruções assumem que o código já está no GitHub e que você possui uma conta na Render com permissão para criar serviços.
+Este documento descreve o processo recomendado para publicar a API (server) e o frontend (web) da plataforma FluxoBet na Render. As instruções assumem que o código já está no GitHub e que você possui uma conta na Render com permissão para criar serviços.
 
 ## Pré-requisitos
 
@@ -13,8 +13,8 @@ Este documento descreve o processo recomendado para publicar a API (server) e o 
 
 O repositório inclui um ficheiro [`render.yaml`](./render.yaml) com a definição de dois serviços:
 
-1. **betpulse-server**: serviço Node que expõe a API REST, o gateway de chat (Socket.IO) e os webhooks do M-Pesa.
-2. **betpulse-web**: site estático construído com Vite/React que consome a API.
+1. **fluxobet-server**: serviço Node que expõe a API REST, o gateway de chat (Socket.IO) e os webhooks do M-Pesa.
+2. **fluxobet-web**: site estático construído com Vite/React que consome a API.
 
 Ao importar o repositório na Render escolha a opção **Blueprint** e a plataforma irá provisionar os serviços automaticamente. Antes de confirmar, edite as variáveis de ambiente marcadas com `sync: false` para inserir os valores secretos.
 
@@ -34,10 +34,10 @@ Caso prefira configurar manualmente, siga os passos abaixo para cada componente.
    - Defina a variável `NODE_VERSION=20` para alinhar com o TypeScript compilado para ES2020.
    - Não defina manualmente a variável `PORT`; a Render fornece o valor adequado durante a execução e a API já utiliza `process.env.PORT`.
 4. **Variáveis de ambiente obrigatórias**
-   - `CORS_ORIGINS`: lista separada por vírgulas com os domínios autorizados a consumir a API (ex.: `https://app.suaempresa.com,https://betpulse-web.onrender.com`).
+   - `CORS_ORIGINS`: lista separada por vírgulas com os domínios autorizados a consumir a API (ex.: `https://app.suaempresa.com,https://fluxobet-web.onrender.com`).
    - `JWT_SECRET`: chave segura para assinar tokens.
    - `MONGO_URI`: string de ligação do MongoDB Atlas (incluindo usuário e senha).
-   - `MONGO_DB_NAME`: nome da base (padrão `betpulse`).
+   - `MONGO_DB_NAME`: nome da base (padrão `fluxobet`).
    - `ADMIN_EMAIL` e `ADMIN_PASSWORD`: credenciais iniciais do administrador.
    - Variáveis M-Pesa: `MPESA_CONSUMER_KEY`, `MPESA_CONSUMER_SECRET`, `MPESA_SHORTCODE`, `MPESA_PASSKEY`, `MPESA_INITIATOR`, `MPESA_CALLBACK_BASE_URL`, `MPESA_ENVIRONMENT` (`sandbox` ou `production`) e, se necessário, `MPESA_SECURITY_CREDENTIAL`, `MPESA_INITIATOR_PASSWORD`, `MPESA_CERTIFICATE_PATH`, `MPESA_COUNTRY_CODE`.
 5. **Conectividade**
@@ -56,8 +56,8 @@ Caso prefira configurar manualmente, siga os passos abaixo para cada componente.
    - Build Command: `npm install && npm run build`
    - Publish Directory: `dist`
 3. **Variáveis de ambiente de build**
-   - `VITE_API_BASE_URL`: URL pública da API (ex.: `https://betpulse-server.onrender.com/api`).
-   - `VITE_SOCKET_URL`: URL base do Socket.IO (normalmente `https://betpulse-server.onrender.com`).
+   - `VITE_API_BASE_URL`: URL pública da API (ex.: `https://fluxobet-server.onrender.com/api`).
+   - `VITE_SOCKET_URL`: URL base do Socket.IO (normalmente `https://fluxobet-server.onrender.com`).
    - `VITE_SOCKET_PATH`: caminho do Socket.IO (padrão `/socket.io`).
 4. **Testes**
    - Após publicar, aceda ao domínio fornecido pela Render e valide o login, registo e chat.

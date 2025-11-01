@@ -1,4 +1,4 @@
-# BetPulse – Plataforma de Apostas Provably Fair
+# FluxoBet – Plataforma de Apostas Provably Fair
 
 Este repositório contém uma solução completa para uma casa de apostas moderna construída em Node.js e React. A stack foi
 organizada para oferecer transparência (provably fair), integração financeira com MPesa Moçambique, ferramentas de gestão
@@ -61,7 +61,7 @@ administrativa e um front-end estilizado que transmite confiança.
    diretório `dist/` exista mesmo em ambientes de deploy (ex.: Render). A API ficará disponível em
    `http://localhost:4000`. Configure as variáveis `MONGO_URI` e `MONGO_DB_NAME` para apontar
    para a instância do MongoDB Atlas (ou local). O script de inicialização cria um utilizador administrador padrão
-   (`admin@betpulse.co.mz / Admin@12345`) e popula automaticamente 11 jogos com probabilidade 1/4 e payout otimizado
+   (`admin@fluxobet.co.mz / Admin@12345`) e popula automaticamente 11 jogos com probabilidade 1/4 e payout otimizado
    para lucro líquido.
 
 2. **Front-end**

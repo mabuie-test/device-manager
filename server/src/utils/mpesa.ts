@@ -259,7 +259,7 @@ class MpesaClient {
       PhoneNumber: msisdn,
       CallBackURL: payload.callbackUrl,
       AccountReference: payload.reference,
-      TransactionDesc: payload.description ?? 'BetPulse top-up',
+      TransactionDesc: payload.description ?? 'FluxoBet top-up',
     };
 
     return this.mpesaPost<StkPushResponse>('/mpesa/stkpush/v1/processrequest', body);
@@ -278,7 +278,7 @@ class MpesaClient {
       Amount: payload.amount,
       PartyA: this.config.shortcode,
       PartyB: msisdn,
-      Remarks: payload.remarks ?? 'BetPulse withdrawal',
+      Remarks: payload.remarks ?? 'FluxoBet withdrawal',
       QueueTimeOutURL: this.config.b2cQueueTimeoutUrl,
       ResultURL: this.config.b2cResultUrl,
       Occasion: payload.reference,

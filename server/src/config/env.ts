@@ -49,11 +49,11 @@ const mpesaEnvironment = process.env.MPESA_ENVIRONMENT === 'production' ? 'produ
 export const env: Environment = {
   port: Number(process.env.PORT || 4000),
   jwtSecret: process.env.JWT_SECRET || 'super-secret-key-change-me',
-  adminEmail: process.env.ADMIN_EMAIL || 'admin@betpulse.co.mz',
+  adminEmail: process.env.ADMIN_EMAIL || 'admin@fluxobet.co.mz',
   adminPassword: process.env.ADMIN_PASSWORD || 'Admin@12345',
   corsOrigins: parseOrigins(process.env.CORS_ORIGINS),
   mongoUri: process.env.MONGO_URI || 'mongodb://127.0.0.1:27017',
-  mongoDbName: process.env.MONGO_DB_NAME || 'betpulse',
+  mongoDbName: process.env.MONGO_DB_NAME || 'fluxobet',
   mpesa: {
     consumerKey: process.env.MPESA_CONSUMER_KEY || 'your-consumer-key',
     consumerSecret: process.env.MPESA_CONSUMER_SECRET || 'your-consumer-secret',

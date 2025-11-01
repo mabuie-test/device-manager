@@ -18,7 +18,7 @@ const ShellLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
       <header className="border-b border-white/10 bg-slate-900/70 backdrop-blur">
         <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
           <Link to="/" className="flex items-center gap-2 text-xl font-semibold tracking-tight">
-            <span className="rounded-full bg-ocean/20 px-3 py-1 text-ocean">BetPulse</span>
+            <span className="rounded-full bg-ocean/20 px-3 py-1 text-ocean">FluxoBet</span>
             <span className="text-sm text-slate-400">Provably Fair</span>
           </Link>
           <nav className="hidden items-center gap-6 text-sm font-medium md:flex">
@@ -85,7 +85,7 @@ const ShellLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
         <div className="mx-auto w-full max-w-7xl px-6 py-10">{children}</div>
       </main>
       <footer className="border-t border-white/5 bg-slate-950/60 py-6 text-center text-sm text-slate-500">
-        © {new Date().getFullYear()} BetPulse. Operação licenciada com segurança e transparência.
+        © {new Date().getFullYear()} FluxoBet. Operação licenciada com segurança e transparência.
       </footer>
     </div>
   );

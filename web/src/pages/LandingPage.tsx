@@ -36,7 +36,7 @@ const LandingPage = () => {
             A plataforma de apostas que prioriza confiança e compliance em Moçambique.
           </h1>
           <p className="text-lg text-slate-300">
-            BetPulse combina jogos de probabilidade 1/4 comprovadamente justos, integração MPesa e um painel administrativo
+            FluxoBet combina jogos de probabilidade 1/4 comprovadamente justos, integração MPesa e um painel administrativo
             robusto. Seja para gerir operações ou jogar com segurança, a experiência é fluída em todos os dispositivos.
           </p>
           <div className="flex flex-wrap items-center gap-4">

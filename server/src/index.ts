@@ -37,7 +37,7 @@ async function bootstrap() {
   createChatGateway(server);
 
   server.listen(env.port, () => {
-    console.log(`BetPulse API em execução na porta ${env.port}`);
+    console.log(`FluxoBet API em execução na porta ${env.port}`);
   });
 }
 

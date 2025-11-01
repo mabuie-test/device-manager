@@ -64,7 +64,7 @@ export async function createDeposit(req: AuthenticatedRequest, res: Response) {
         phoneNumber: msisdn,
         reference,
         callbackUrl,
-        description: 'Recarga BetPulse',
+        description: 'Recarga FluxoBet',
       });
       await mergeTransactionMetadata(tx.id, {
         mpesa: {

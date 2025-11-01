@@ -14,7 +14,10 @@ import ChatPage from './pages/ChatPage';
 import ShellLayout from './components/ShellLayout';
 
 function ProtectedRoute({ children }: { children: JSX.Element }) {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, isLoading } = useAuth();
+  if (isLoading) {
+    return <div className="py-10 text-center text-slate-300">A validar a sua sessão…</div>;
+  }
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />;
   }
@@ -22,7 +25,10 @@ function ProtectedRoute({ children }: { children: JSX.Element }) {
 }
 
 function AdminRoute({ children }: { children: JSX.Element }) {
-  const { isAuthenticated, isAdmin } = useAuth();
+  const { isAuthenticated, isAdmin, isLoading } = useAuth();
+  if (isLoading) {
+    return <div className="py-10 text-center text-slate-300">A validar a sua sessão…</div>;
+  }
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />;
   }
